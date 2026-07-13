@@ -1,0 +1,1188 @@
+// MD screen — the managing director's desk view. Executive oversight of the
+// GT breakout desk (long + short strategies) with order placement front-and-
+// centre. Built entirely on HER design system (see prosperity_frontend_extract/
+// HER_DESIGN_SYSTEM.md): tiny uppercase letter-spaced labels, hairline pill
+// controls, zinc palette + JetBrains-Mono data, accents ONLY for status.
+import { useEffect, useMemo, useRef, useState } from "react";
+import { generateMdData } from "./lib/mdData.js";
+import { PnlChart } from "./components/Charts.jsx";
+import { Card, Money, Chip, Label } from "./components/ui.jsx";
+import { ComposedChart, Area, Scatter, XAxis, YAxis, ReferenceLine, Tooltip, ResponsiveContainer } from "recharts";
+import { sileo, Toaster } from "sileo";
+
+// Sileo physics-toast notifications — pop from top-centre. Safe wrapper:
+// info/warning fall back to success if a variant isn't present.
+function notify(kind, title) {
+  const fn = typeof sileo?.[kind] === "function" ? sileo[kind] : sileo?.success;
+  try { fn?.({ title }); } catch { try { sileo?.success?.({ title }); } catch { /* noop */ } }
+}
+
+const OPERATOR = { desk: "Gautam Group", name: "Managing Director", account: "Paper · DU" };
+
+// ── accent helpers: her -50/-100 bg + -700 text recipe (colour = status only) ──
+const STATE_TONE = {
+  IN_POSITION: "border-emerald-200 bg-emerald-50 text-emerald-700",
+  WAITING_REENTRY: "border-amber-300 bg-amber-100 text-amber-700",
+  ORDER_ENTRY: "border-sky-200 bg-sky-50 text-sky-700",
+  MONITORING: "border-zinc-200 bg-zinc-50 text-zinc-500",
+};
+const SEV_TONE = {
+  HIGH: "border-red-100 bg-red-50 text-red-700",
+  MEDIUM: "border-amber-300 bg-amber-100 text-amber-700",
+  LOW: "border-zinc-200 bg-zinc-50 text-zinc-500",
+};
+
+// Deployable strategies — data-driven so adding one is a single entry.
+const STRATEGIES = [
+  { id: "long_breakout", name: "Long Breakout", side: "LONG", desc: "BUY stop-limit on breakout · protective SELL stop" },
+  { id: "short_breakout", name: "Short Breakout", side: "SHORT", desc: "SELL stop-limit on breakdown · protective BUY-cover stop" },
+];
+
+function fmtUsd(n) {
+  return (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+// Full timestamp in Dubai / Gulf Standard Time (the desk's local time).
+const _DUBAI = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Dubai", day: "2-digit", month: "short",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+});
+const fmtDubai = (ms) => _DUBAI.format(new Date(ms)).replace(",", "");
+
+// ── minimal corner line-icons (Prosperity's stat-card accent) ──────────────
+const ICONS = {
+  equity: <path d="M2 11l3.5-3.5 3 3L14 4.5M14 4.5h-3.2M14 4.5v3.2" />,      // up-trend + arrow
+  pnl: <path d="M2 11l3.5-3.5 3 3L14 4.5M14 4.5h-3.2M14 4.5v3.2" />,          // up-trend + arrow
+  exposure: <path d="M8 2.2l6 3-6 3-6-3 6-3zM2 8l6 3 6-3M2 10.8l6 3 6-3" />, // layers
+  bp: <><circle cx="8" cy="8" r="6" /><path d="M8 8V2.4M8 8l4.2 2.4" /></>,   // gauge/clock
+  win: <><circle cx="8" cy="8" r="6" /><path d="M5.3 8.2l1.8 1.8 3.6-3.9" /></>, // check-in-ring
+  dd: <path d="M2 5l3.5 3.5 3-3L14 11.5M14 11.5h-3.2M14 11.5v-3.2" />,       // down-trend + arrow
+};
+function Ico({ d }) {
+  return (
+    <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0 text-zinc-300" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+      {d}
+    </svg>
+  );
+}
+
+// ── live NYSE session clock (a small personalisation touch) ────────────────
+function useSession() {
+  const [s, setS] = useState(sess);
+  useEffect(() => {
+    const t = setInterval(() => setS(sess()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  return s;
+}
+function sess() {
+  const p = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour12: false, weekday: "short", hour: "2-digit", minute: "2-digit" }).formatToParts(new Date());
+  const g = (t) => p.find((x) => x.type === t)?.value ?? "";
+  const wd = g("weekday"), hh = +g("hour"), mm = g("minute");
+  const mins = hh * 60 + +mm, weekend = wd === "Sat" || wd === "Sun";
+  const clock = `${String(hh).padStart(2, "0")}:${mm} ET`;
+  if (weekend) return { label: "Closed", tone: "bg-zinc-300", clock };
+  if (mins >= 570 && mins < 960) return { label: "Market Open", tone: "bg-emerald-500", clock };
+  if (mins >= 240 && mins < 570) return { label: "Pre-Market", tone: "bg-amber-400", clock };
+  if (mins >= 960 && mins < 1200) return { label: "After-Hours", tone: "bg-amber-400", clock };
+  return { label: "Closed", tone: "bg-zinc-300", clock };
+}
+
+export default function MdScreen() {
+  const [data, setData] = useState(() => generateMdData());
+  const { account, pnl_series, position_series, positions, alerts } = data;
+  const marker = pnl_series.at(-1).timestamp;
+  const ticketRef = useRef(null);
+
+  // ── cross-panel linkage: click a position → it flows into the ticket ──
+  const [order, setOrder] = useState({
+    mode: "STRATEGY", strategyId: "long_breakout", asset: "EQUITY", symbol: "NVDA",
+    qty: "100", value: "10000", sizeMode: "QTY", trigger: "0",
+    stop: "0.05", stopUnit: "PCT", offset: "0.05", offsetUnit: "ABS",
+    orderType: "MKT", limitPrice: "0", stopPrice: "0", tif: "DAY",
+  });
+  const [selected, setSelected] = useState(null);
+  function pickPosition(p) {
+    setOrder((o) => ({
+      ...o, mode: "STRATEGY",
+      strategyId: p.strategy === "SHORT" ? "short_breakout" : "long_breakout",
+      asset: p.asset, symbol: p.symbol, qty: String(p.qty || 100), trigger: String(p.last), stop: "0.05",
+    }));
+    setSelected(p.symbol);
+    ticketRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  // clicking a position/live-card opens a symbol detail popup over the screen
+  const [detail, setDetail] = useState(null);
+  function actOnPosition(p, kind) {
+    notify(kind === "Modify stop" ? "info" : "warning", `${kind} · ${p.symbol}`);
+  }
+
+  // New: Add strategy and date range filters
+  const [assetFilter, setAssetFilter] = useState("ALL");
+  const [strategyFilter, setStrategyFilter] = useState("all");
+  const [dateRange, setDateRange] = useState("today");
+
+  // Find all strategies available in data
+  const allStrategies = useMemo(() => {
+    return Array.from(new Set(positions.map(p => p.strategy))).sort();
+  }, [positions]);
+
+  // Apply filters: first by strategy, then by asset
+  const filtered = useMemo(() => {
+    let ps = positions;
+    if (strategyFilter !== "all") {
+      ps = ps.filter(p => p.strategy === strategyFilter);
+    }
+    // (date filtering stub – just ignore for now, ready for the future)
+    if (assetFilter !== "ALL") {
+      ps = ps.filter(p => p.asset === assetFilter);
+    }
+    return ps;
+  }, [positions, strategyFilter, assetFilter]);
+
+
+  const peak = useMemo(() => Math.max(...pnl_series.map((p) => p.total)), [pnl_series]);
+  const trough = useMemo(() => Math.min(...pnl_series.map((p) => p.total), 0), [pnl_series]);
+
+  // desk-wide combined feeds for the main page
+  const allFills = useMemo(
+    () => positions
+      .flatMap((p) => p.fills.map((f) => ({ ...f, symbol: p.symbol, asset: p.asset, strategy: p.strategy })))
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, 16),
+    [positions],
+  );
+  const working = useMemo(
+    () => positions.map((p) => {
+      const long = p.strategy === "LONG";
+      if (p.qty) return { symbol: p.symbol, asset: p.asset, side: long ? "SELL" : "BUY", type: "STP", note: "protective", qty: p.qty, price: p.stop, status: "Working" };
+      if (p.state === "WAITING_REENTRY") return { symbol: p.symbol, asset: p.asset, side: long ? "BUY" : "SELL", type: "LMT", note: "re-entry", qty: 100, price: p.entry, status: "Working" };
+      return { symbol: p.symbol, asset: p.asset, side: long ? "BUY" : "SELL", type: "STP LMT", note: "entry", qty: 100, price: p.trigger || p.last, status: "PreSubmitted" };
+    }),
+    [positions],
+  );
+
+  const kpis = [
+    { label: "Equity", icon: ICONS.equity, value: fmtUsd(account.equity), sub: `${account.bots} strategies live` },
+    { label: "Day P&L", icon: ICONS.pnl, money: account.dayPnl, sub: `${account.dayPnlPct >= 0 ? "+" : ""}${account.dayPnlPct.toFixed(2)}%` },
+    { label: "Open Exposure", icon: ICONS.exposure, value: fmtUsd(account.exposure), sub: `${account.open} positions` },
+    { label: "BP Utilization", icon: ICONS.bp, value: `${account.bpUsedPct.toFixed(1)}%`, sub: "of buying power" },
+    { label: "Win Rate", icon: ICONS.win, value: `${account.winRate}%`, sub: `${account.wins}W / ${account.losses}L` },
+    { label: "Max Drawdown", icon: ICONS.dd, value: fmtUsd(trough), sub: `peak ${fmtUsd(peak)}` },
+  ];
+
+  return (
+    <div className="flex min-h-screen bg-zinc-100 text-zinc-900">
+      <Sidebar
+        live={positions.filter((p) => p.qty)}
+        selected={detail?.symbol}
+        onPick={setDetail}
+        onNew={() => ticketRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
+        onRegen={() => setData(generateMdData())}
+      />
+
+      <div className="flex min-w-0 flex-1 flex-col">
+        <TopBar />
+        <main className="w-full flex-1 space-y-5 px-8 py-6">
+          {/* KPI ROW */}
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+            {kpis.map((k) => (
+              <div key={k.label} className="rounded-xl border border-zinc-200 bg-white px-4 py-3 shadow-sm transition-colors hover:border-zinc-300">
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] font-mono font-bold uppercase tracking-[0.16em] text-zinc-400">{k.label}</span>
+                  <Ico d={k.icon} />
+                </div>
+                <div className="mt-1.5 font-mono text-[19px] font-medium tabular-nums leading-none">
+                  {k.money !== undefined ? <Money value={k.money} /> : <span className="text-zinc-900">{k.value}</span>}
+                </div>
+                <div className="mt-1.5 font-mono text-[10px] tabular-nums text-zinc-400">{k.sub}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* MAIN GRID: curve + positions (left) · order ticket + alerts (right) */}
+          <div className="grid grid-cols-1 gap-5 xl:[grid-template-columns:minmax(0,1fr)_360px]">
+            <div className="min-w-0 space-y-5">
+              <Positions
+                rows={filtered}
+                asset={assetFilter}
+                setAsset={setAssetFilter}
+                strategy={strategyFilter}
+                setStrategy={setStrategyFilter}
+                allStrategies={allStrategies}
+                dateRange={dateRange}
+                setDateRange={setDateRange}
+                onPick={setDetail}
+                selected={detail?.symbol}
+                onAction={actOnPosition}
+              />
+
+              <Card
+                title="Cumulative P&L — Today"
+                subtitle="Intraday realised + unrealised across all strategies"
+                right={<span className="font-mono text-[11px] tabular-nums"><Money value={account.dayPnl} /></span>}
+              >
+                <PnlChart pnlSeries={pnl_series} marker={marker} />
+              </Card>
+
+              <Card title="Net Position — Today" subtitle="Desk-wide net units across strategies">
+                <PositionChart series={position_series} />
+              </Card>
+
+              <RecentFills fills={allFills} />
+              <WorkingOrders rows={working} />
+            </div>
+
+            <div className="space-y-5" ref={ticketRef}>
+              <OrderTicket order={order} setOrder={setOrder} fromSymbol={selected} onClear={() => setSelected(null)} />
+              <Alerts alerts={alerts} />
+            </div>
+          </div>
+
+          <SystemLogs />
+        </main>
+      </div>
+
+      {detail && (
+        <PositionDetail p={detail} onClose={() => setDetail(null)} onOrder={(pp) => { pickPosition(pp); setDetail(null); }} />
+      )}
+      <Toaster position="top-center" theme="light" />
+    </div>
+  );
+}
+
+// ── symbol detail popup (drill-in over the current screen) ──────────────────
+function DCell({ label, children, tone }) {
+  const c = tone === "pos" ? "text-emerald-600" : tone === "neg" ? "text-red-600" : "text-zinc-900";
+  return (
+    <div className="rounded-xl border border-zinc-200 bg-white px-3 py-2.5">
+      <div className="text-[9px] font-mono font-bold uppercase tracking-[0.16em] text-zinc-400">{label}</div>
+      <div className={`mt-1 font-mono text-[14px] tabular-nums ${c}`}>{children}</div>
+    </div>
+  );
+}
+// ── the drill-in price chart: price path + entry/stop lines + fill markers ──
+function ChartTip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+  const px = payload.find((x) => x.dataKey === "price");
+  return (
+    <div className="rounded-lg border border-zinc-700 bg-zinc-800 px-3 py-2 text-white shadow-xl">
+      <div className="font-mono text-[9px] uppercase tracking-[0.16em] text-zinc-400">t{label}</div>
+      {px && <div className="font-mono text-[12px] tabular-nums">{px.value}</div>}
+    </div>
+  );
+}
+function SymbolChart({ p }) {
+  const data = useMemo(() => {
+    const rows = p.series.map((s) => ({ ...s, buy: null, sell: null }));
+    for (const f of p.fills) {
+      const r = rows[Math.min(rows.length - 1, f.x)];
+      if (f.side === "BUY") r.buy = f.price; else r.sell = f.price;
+    }
+    return rows;
+  }, [p]);
+  const axis = { tick: { fontSize: 10, fill: "#a1a1aa", fontFamily: "JetBrains Mono" }, tickLine: false };
+  return (
+    <div className="h-[300px] w-full">
+      <ResponsiveContainer>
+        <ComposedChart data={data} margin={{ top: 8, right: 10, bottom: 0, left: 0 }}>
+          <defs>
+            <linearGradient id="pxf" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#71717a" stopOpacity="0.14" />
+              <stop offset="100%" stopColor="#71717a" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <XAxis dataKey="t" {...axis} axisLine={{ stroke: "#e4e4e7" }} />
+          <YAxis domain={["auto", "auto"]} orientation="right" width={56} {...axis} axisLine={false} />
+          <Tooltip content={<ChartTip />} />
+          <ReferenceLine y={p.entry} stroke="#a1a1aa" strokeDasharray="4 3" strokeWidth={1} />
+          <ReferenceLine y={p.stop} stroke="#ef4444" strokeDasharray="4 3" strokeWidth={1} />
+          <Area type="monotone" dataKey="price" stroke="#3f3f46" strokeWidth={1.4} fill="url(#pxf)" isAnimationActive={false} />
+          <Scatter dataKey="buy" fill="#2563eb" isAnimationActive={false} />
+          <Scatter dataKey="sell" fill="#f59e0b" isAnimationActive={false} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function PositionDetail({ p, onClose, onOrder }) {
+  useEffect(() => {
+    const h = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+  const chg = ((p.last - p.entry) / p.entry) * 100;
+  const value = p.qty ? p.last * p.qty : 0;
+  const buy = Math.max(0, Math.min(100, p.buyPct));
+  const pill = "rounded-full border border-zinc-200 bg-white px-2.5 py-1 font-mono text-[11px] tabular-nums";
+  const tc = "grid grid-cols-[1.6fr_0.5fr_0.8fr_0.5fr_0.7fr_0.9fr_0.8fr_0.85fr_0.95fr_0.9fr_0.9fr] items-center gap-x-4 px-4";
+
+  return (
+    <div onClick={onClose} className="fixed inset-0 z-[100] flex items-center justify-center bg-zinc-900/50 p-4 backdrop-blur-sm sm:p-8">
+      <div onClick={(e) => e.stopPropagation()} className="flex max-h-[92vh] w-full max-w-[1160px] flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl">
+        {/* header */}
+        <div className="flex items-center justify-between border-b border-zinc-100 px-6 py-4">
+          <div className="flex items-center gap-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className={`h-2 w-2 rounded-full ${p.strategy === "LONG" ? "bg-emerald-500" : "bg-red-500"}`} />
+                <h3 className="text-lg font-semibold text-zinc-900">{p.symbol}</h3>
+                <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-zinc-400">{p.asset} · {p.strategy}</span>
+                <span className={`rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] ${STATE_TONE[p.state]}`}>{p.state.replace(/_/g, " ")}</span>
+              </div>
+              <div className="mt-1 flex items-baseline gap-2">
+                <span className="font-mono text-2xl font-medium tabular-nums text-zinc-900">{p.last}</span>
+                <span className={`font-mono text-[12px] tabular-nums ${chg >= 0 ? "text-emerald-600" : "text-red-600"}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(2)}%</span>
+              </div>
+            </div>
+            {/* live bid/ask/spread */}
+            <div className="ml-2 hidden items-center gap-2 sm:flex">
+              <span className={`${pill} text-emerald-600`}>BID {p.bid}</span>
+              <span className={`${pill} text-red-600`}>ASK {p.ask}</span>
+              <span className={`${pill} text-zinc-600`}>{p.spreadBps} bp</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button onClick={() => onOrder(p)} className="rounded-full bg-zinc-900 px-4 py-2 text-[10px] font-bold uppercase tracking-[0.16em] text-white shadow-sm shadow-zinc-200 transition-all hover:bg-zinc-800">New Order</button>
+            <button onClick={onClose} className="grid h-8 w-8 place-items-center rounded-full border border-zinc-200 text-zinc-400 transition-colors hover:border-zinc-400 hover:text-zinc-700">✕</button>
+          </div>
+        </div>
+
+        {/* body */}
+        <div className="min-h-0 flex-1 space-y-5 overflow-auto px-6 py-5">
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+            {/* chart */}
+            <div className="lg:col-span-2">
+              <div className="rounded-xl border border-zinc-200 bg-white">
+                <div className="flex items-center justify-between border-b border-zinc-100 px-4 py-2.5">
+                  <span className="text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-600">Price & Fills</span>
+                  <div className="flex items-center gap-3 font-mono text-[9px] uppercase tracking-[0.12em] text-zinc-400">
+                    <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-[#2563eb]" />Buy</span>
+                    <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-[#f59e0b]" />Sell</span>
+                    <span className="flex items-center gap-1"><span className="h-px w-3 bg-zinc-400" />Entry</span>
+                    <span className="flex items-center gap-1"><span className="h-px w-3 bg-red-400" />Stop</span>
+                  </div>
+                </div>
+                <div className="px-2 py-2"><SymbolChart p={p} /></div>
+              </div>
+            </div>
+            {/* right stats */}
+            <div className="space-y-4">
+              <div>
+                <Label>Snapshot</Label>
+                <div className="mt-2 grid grid-cols-2 gap-2.5">
+                  <DCell label="VWAP">{p.vwap}</DCell>
+                  <DCell label="Volume">{(p.volume / 1e6).toFixed(2)}M</DCell>
+                  <DCell label="Day High">{p.high}</DCell>
+                  <DCell label="Day Low">{p.low}</DCell>
+                </div>
+              </div>
+              <div>
+                <Label>Execution</Label>
+                <div className="mt-2 grid grid-cols-2 gap-2.5">
+                  <DCell label="Trades">{p.tradeCount}</DCell>
+                  <DCell label="Cycle">#{p.cycle}</DCell>
+                  <DCell label="Avg Comm">${p.avgCommission}</DCell>
+                  <DCell label="Total Comm">${p.totalCommission}</DCell>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* position internals */}
+          <div>
+            <Label>Position</Label>
+            <div className="mt-2 grid grid-cols-2 gap-2.5 sm:grid-cols-4 lg:grid-cols-8">
+              <DCell label="Qty">{p.qty ? p.qty.toLocaleString() : "flat"}</DCell>
+              <DCell label="Entry">{p.entry}</DCell>
+              <DCell label="Stop" tone="neg">{p.stop}</DCell>
+              <DCell label="Offset">{p.offset}</DCell>
+              <DCell label="SL %">{p.slPct}%</DCell>
+              <DCell label="Value">{p.qty ? fmtUsd(value) : "—"}</DCell>
+              <DCell label="Unreal" tone={p.pnl >= 0 ? "pos" : "neg"}>{p.pnl ? (p.pnl >= 0 ? "+" : "") + p.pnl.toLocaleString() : "—"}</DCell>
+              <DCell label="Realized" tone={p.realized >= 0 ? "pos" : "neg"}>{(p.realized >= 0 ? "+" : "") + p.realized.toLocaleString()}</DCell>
+            </div>
+          </div>
+
+          {/* market pressure */}
+          <div>
+            <div className="flex items-center justify-between">
+              <Label>Market Pressure</Label>
+              <span className="font-mono text-[10px] tabular-nums text-zinc-400">{buy}% buy · {100 - buy}% sell</span>
+            </div>
+            <div className="mt-2 flex h-2.5 overflow-hidden rounded-full bg-zinc-100">
+              <div className="bg-emerald-500" style={{ width: `${buy}%` }} />
+              <div className="bg-red-400" style={{ width: `${100 - buy}%` }} />
+            </div>
+          </div>
+
+          {/* trades sheet — full execution audit */}
+          <div>
+            <div className="flex items-center justify-between">
+              <Label>Trades Sheet</Label>
+              <span className="font-mono text-[10px] tabular-nums text-zinc-400">{p.fills.length} fills · avg comm ${p.avgCommission} · times in Dubai (GST)</span>
+            </div>
+            <div className="mt-2 overflow-hidden rounded-xl border border-zinc-200">
+              <div className={`${tc} border-b border-zinc-100 bg-zinc-50 py-2.5 text-[9px] font-mono uppercase tracking-[0.16em] text-zinc-400`}>
+                <span>Time · GST</span>
+                <span>Side</span>
+                <span>Type</span>
+                <span>TIF</span>
+                <span className="text-right">Qty</span>
+                <span className="text-right">Fill</span>
+                <span className="text-right">Slippage</span>
+                <span className="text-right">Comm</span>
+                <span>Venue</span>
+                <span className="text-right">Order #</span>
+                <span className="text-right">P&L</span>
+              </div>
+              <div className="divide-y divide-zinc-100">
+                {p.fills.map((f, i) => (
+                  <div key={i} className={`${tc} py-2.5 font-mono text-[12px] tabular-nums transition-colors hover:bg-zinc-50`}>
+                    <span className="text-zinc-500">{fmtDubai(f.ts)}</span>
+                    <span className={f.side === "BUY" ? "font-medium text-emerald-600" : "font-medium text-red-600"}>{f.side}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-zinc-500">{f.type}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-zinc-400">{f.tif}</span>
+                    <span className="text-right text-zinc-600">{f.qty.toLocaleString()}</span>
+                    <span className="text-right text-zinc-800">{f.price}</span>
+                    <span className={`text-right ${f.slippageBp > 0 ? "text-red-600" : "text-emerald-600"}`}>{f.slippageBp > 0 ? "+" : ""}{f.slippageBp}bp</span>
+                    <span className="text-right text-zinc-500">${f.commission.toFixed(2)}</span>
+                    <span className="text-[10px] uppercase tracking-wide text-zinc-400">{f.exchange}</span>
+                    <span className="text-right text-zinc-400">#{f.orderId}</span>
+                    <span className="text-right">{f.pnl ? <Money value={f.pnl} /> : <span className="text-zinc-300">—</span>}</span>
+                  </div>
+                ))}
+              </div>
+              <div className={`${tc} border-t border-zinc-100 bg-zinc-50/60 py-2.5 font-mono text-[11px] tabular-nums text-zinc-500`}>
+                <span className="uppercase tracking-[0.14em] text-zinc-400">Total</span>
+                <span /><span /><span /><span /><span /><span />
+                <span className="text-right text-zinc-700">${p.totalCommission}</span>
+                <span /><span />
+                <span className="text-right"><Money value={p.pnl + p.realized} /></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── sidebar ────────────────────────────────────────────────────────────────
+function Sidebar({ onNew, onRegen, live = [], onPick, selected }) {
+  const nav = ["Overview", "Positions", "Activity", "Statements"];
+  return (
+    <aside className="sticky top-0 flex h-screen w-[300px] shrink-0 flex-col border-r border-zinc-200 bg-white px-5 py-5">
+      <div className="flex items-center gap-2.5 px-1">
+        <div className="grid h-8 w-8 place-items-center rounded-lg bg-zinc-900 font-mono text-[12px] font-bold text-white">GT</div>
+        <div className="leading-tight">
+          <div className="text-[13px] font-semibold tracking-tight">GT Capital</div>
+          <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-zinc-400">Desk · User</div>
+        </div>
+      </div>
+
+      <button
+        onClick={onNew}
+        className="group mt-5 flex w-full items-center justify-center gap-2 rounded-2xl bg-zinc-900 py-4 text-xs font-bold uppercase tracking-widest text-white shadow-xl shadow-zinc-200 transition-all hover:bg-zinc-800"
+      >
+        + New Order
+      </button>
+
+      {/* access gate — the MD view is oversight; order placement needs admin approval */}
+      <div className="mt-4 rounded-xl border border-amber-300 bg-amber-100 px-3.5 py-3">
+        <div className="flex items-center justify-between">
+          <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-amber-700">Access</div>
+          <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 text-amber-700" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="3.5" y="7" width="9" height="6" rx="1.2" />
+            <path d="M5.5 7V5.2a2.5 2.5 0 0 1 5 0V7" />
+          </svg>
+        </div>
+        <div className="mt-1 text-[13px] font-semibold text-zinc-800">Admin approval required</div>
+        <div className="font-mono text-[10px] text-amber-700/80">Order placement is gated · read-only</div>
+      </div>
+
+      <div className="mt-6 px-1"><Label>Views</Label></div>
+      <nav className="mt-2 space-y-0.5">
+        {nav.map((n, i) => (
+          <button key={n} className={`flex w-full items-center rounded-lg px-3 py-2 text-[12px] font-medium transition-colors ${i === 0 ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"}`}>
+            {n}
+          </button>
+        ))}
+      </nav>
+
+      {/* live positions — minimal stacked cards (ticker · side · qty · LTP) */}
+      <div className="mt-6 flex min-h-0 flex-1 flex-col">
+        <div className="flex items-center justify-between px-1">
+          <Label>Live</Label>
+          <span className="font-mono text-[9px] font-bold text-zinc-400">{live.length}</span>
+        </div>
+        <div className="mt-2 space-y-1.5 overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {live.map((p) => (
+            <button
+              key={p.symbol}
+              onClick={() => onPick?.(p)}
+              title="Load into order ticket"
+              className={`w-full rounded-lg px-3 py-2 text-left transition-colors ${selected === p.symbol ? "bg-zinc-800 ring-1 ring-inset ring-white/25" : "bg-zinc-900 hover:bg-zinc-800"}`}
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <span className={`h-1.5 w-1.5 rounded-full ${p.strategy === "LONG" ? "bg-emerald-400" : "bg-red-400"}`} />
+                  <span className="text-[12px] font-semibold text-white">{p.symbol}</span>
+                </div>
+                <span className="font-mono text-[11px] tabular-nums text-white/90">{p.last}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between font-mono text-[9px] uppercase tracking-[0.12em] text-white/40">
+                <span>{p.asset} · {p.strategy}</span>
+                <span className="tabular-nums">{p.qty.toLocaleString()}</span>
+              </div>
+            </button>
+          ))}
+          {live.length === 0 && <div className="px-1 py-2 text-[11px] text-zinc-400">No open positions.</div>}
+        </div>
+      </div>
+
+      <div className="mt-4 shrink-0 space-y-2">
+        <button onClick={onRegen} className="w-full rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-500 transition-colors hover:border-zinc-400 hover:text-zinc-900">
+          Regenerate demo
+        </button>
+        <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 font-mono text-[10px] text-zinc-500">
+          <div className="flex items-center justify-between"><span>TWS 127.0.0.1:7497</span><span className="h-2 w-2 rounded-full bg-emerald-500" /></div>
+          <div className="mt-1 text-zinc-400">paper · demo data · v0.1</div>
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+// ── top bar ──────────────────────────────────────────────────────────────
+function TopBar() {
+  const s = useSession();
+  return (
+    <header className="sticky top-0 z-10 flex h-[64px] items-center justify-between border-b border-zinc-200 bg-zinc-100/80 px-8 backdrop-blur">
+      <div>
+        <h1 className="text-[17px] font-semibold tracking-tight text-zinc-900">Trading Desk</h1>
+        <div className="text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-400">Live oversight · paper account</div>
+      </div>
+      <div className="flex items-center gap-3">
+        <div className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1.5">
+          <span className="relative flex h-2 w-2">
+            {s.label === "Market Open" && <span className={`absolute inline-flex h-full w-full animate-ping rounded-full ${s.tone} opacity-60`} />}
+            <span className={`relative inline-flex h-2 w-2 rounded-full ${s.tone}`} />
+          </span>
+          <span className="text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-600">{s.label}</span>
+          <span className="font-mono text-[11px] tabular-nums text-zinc-400">{s.clock}</span>
+        </div>
+        <div className="grid h-9 w-9 place-items-center rounded-full bg-zinc-900 font-mono text-[11px] font-semibold text-white">MD</div>
+      </div>
+    </header>
+  );
+}
+
+// ── positions table ────────────────────────────────────────────────────────
+function RowAct({ tone, children, onClick }) {
+  const map = {
+    red: "border-red-200 bg-red-50 text-red-700 hover:bg-red-100",
+    amber: "border-amber-200 bg-amber-50 text-amber-700 hover:bg-amber-100",
+    zinc: "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-100",
+    dark: "border-zinc-900 bg-zinc-900 text-white hover:bg-zinc-800",
+  };
+  return <button onClick={onClick} className={`rounded-full border px-2 py-1 text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${map[tone]}`}>{children}</button>;
+}
+
+function Positions({ rows, asset, setAsset, strategy, setStrategy, allStrategies, dateRange, setDateRange, onPick, selected, onAction }) {
+  // Design: mono micro segmented chip groups for date + strategy
+  const dateRanges = [
+    { key: "today", label: "Today" },
+    { key: "yesterday", label: "Yesterday" },
+    { key: "last7", label: "Last 7 Days" },
+  ];
+  const allStratsWithAll = ["all"].concat(allStrategies);
+
+  // For HER-style dropdowns, local state for open/closed
+  const [dropdownOpen, setDropdownOpen] = useState(false); // For positions filter strategy
+  const [dateDropdownOpen, setDateDropdownOpen] = useState(false);
+
+  // For New Order strategy dropdown
+  const [strategyDropdownOpen, setStrategyDropdownOpen] = useState(false);
+
+  // Close dropdowns on click-out
+  useEffect(() => {
+    if (!dropdownOpen && !dateDropdownOpen && !strategyDropdownOpen) return;
+    function onDocClick(e) {
+      if (dropdownOpen && !e.target.closest('.her-strat-dropdown')) setDropdownOpen(false);
+      if (dateDropdownOpen && !e.target.closest('.her-date-dropdown')) setDateDropdownOpen(false);
+      if (strategyDropdownOpen && !e.target.closest('.her-strat-dropdown')) setStrategyDropdownOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick, true);
+    return () => document.removeEventListener('mousedown', onDocClick, true);
+  }, [dropdownOpen, dateDropdownOpen, strategyDropdownOpen]);
+
+  const cols = "grid grid-cols-[1.3fr_0.95fr_0.6fr_0.85fr_0.85fr_0.7fr_0.55fr_1fr_0.85fr] items-center gap-x-3";
+  return (
+    <Card
+      title="Positions & Strategies"
+      subtitle={
+        <div className="flex flex-wrap items-center gap-3 mb-3">
+          <Label>Date</Label>
+          <div className="relative her-date-dropdown">
+            <button
+              type="button"
+              className={`rounded-full border px-3 py-1.5 pr-7 text-[10px] font-bold uppercase tracking-[0.16em] transition-colors font-mono flex items-center min-w-[90px]
+                ${dateRange === "today" ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-500 border-zinc-200 hover:text-zinc-900 hover:border-zinc-400"}`}
+              onClick={e => {
+                e.preventDefault();
+                setDateDropdownOpen(s => !s);
+              }}
+              style={{ position: 'relative' }}
+              aria-haspopup="listbox"
+              aria-expanded={dateDropdownOpen ? 'true' : 'false'}
+            >
+              {dateRanges.find(x => x.key === dateRange)?.label}
+              <svg
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-400 pointer-events-none"
+                fill="none" viewBox="0 0 14 14"
+                stroke="currentColor" strokeWidth="2"
+                aria-hidden="true"
+              >
+                <path d="M4 6l3 3 3-3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {dateDropdownOpen && (
+              <div
+                className="absolute left-0 z-50 mt-2 w-full max-h-44 overflow-y-auto rounded-xl border border-zinc-200 bg-white shadow-xl animate-fadeIn"
+                style={{ minWidth: 100 }}
+                onBlur={() => setDateDropdownOpen(false)}
+                tabIndex={0}
+              >
+                {dateRanges.map(dr => (
+                  <button
+                    key={dr.key}
+                    className={`block w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-[0.16em] font-bold transition-colors rounded ${dateRange === dr.key ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900"}`}
+                    onClick={() => {
+                      setDateRange(dr.key);
+                      setDateDropdownOpen(false);
+                    }}
+                  >
+                    {dr.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <Label>Strategy</Label>
+          <div className="relative">
+            <button
+              type="button"
+              className={`rounded-full border px-3 py-1.5 pr-7 text-[10px] font-bold uppercase tracking-[0.16em] transition-colors font-mono flex items-center min-w-[120px]
+                ${strategy === "all" ? "bg-zinc-900 text-white border-zinc-900" : "bg-white text-zinc-500 border-zinc-200 hover:text-zinc-900 hover:border-zinc-400"}`}
+              onClick={e => {
+                e.preventDefault();
+                setDropdownOpen(s => !s);
+              }}
+              style={{ position: 'relative' }}
+              aria-haspopup="listbox"
+              aria-expanded={dropdownOpen ? 'true' : 'false'}
+            >
+              {strategy === 'all' ? 'All Strategies' : strategy}
+              <svg
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-400 pointer-events-none"
+                fill="none" viewBox="0 0 14 14"
+                stroke="currentColor" strokeWidth="2"
+                aria-hidden="true"
+              >
+                <path d="M4 6l3 3 3-3" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+            {dropdownOpen && (
+              <div
+                className="absolute left-0 z-50 mt-2 w-full max-h-44 overflow-y-auto rounded-xl border border-zinc-200 bg-white shadow-xl animate-fadeIn"
+                style={{ minWidth: 140 }}
+                onBlur={() => setDropdownOpen(false)}
+                tabIndex={0}
+              >
+                {allStratsWithAll.map(stratLabel => (
+                  <button
+                    key={stratLabel}
+                    className={`block w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-[0.16em] font-bold transition-colors rounded ${strategy === stratLabel ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900"}`}
+                    onClick={() => {
+                      setStrategy(stratLabel);
+                      setDropdownOpen(false);
+                    }}
+                  >
+                    {stratLabel === "all" ? "All Strategies" : stratLabel}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      }
+      right={
+        <div className="inline-flex gap-1 rounded-full border border-zinc-200 bg-zinc-50 p-1">
+          {["ALL", "EQUITY", "FX", "CFD"].map((a) => (
+            <Chip key={a} active={a === asset} onClick={() => setAsset(a)}>{a}</Chip>
+          ))}
+        </div>
+      }
+    >
+      <div className={`${cols} mb-2 border-b border-zinc-100 pb-2 text-[9px] font-mono uppercase tracking-[0.16em] text-zinc-400`}>
+        <span>Symbol</span><span>State</span><span className="text-right">Qty</span><span className="text-right">Entry</span><span className="text-right">Last</span><span className="text-right">Offset</span><span className="text-right">SL %</span><span className="text-right">Value</span><span className="text-right">P&L</span>
+      </div>
+      <div className="space-y-px">
+        {rows.map((p) => (
+          <div
+            key={p.symbol}
+            onClick={() => onPick?.(p)}
+            title="View details"
+            className={`${cols} group relative cursor-pointer rounded-lg px-1 py-2 transition-colors ${selected === p.symbol ? "bg-zinc-50 ring-1 ring-inset ring-zinc-900/10" : "hover:bg-zinc-50"}`}
+          >
+            <div className="flex items-center gap-2">
+              <span className={`inline-block h-1.5 w-1.5 rounded-full ${p.strategy === "LONG" ? "bg-emerald-500" : "bg-red-500"}`} />
+              <span className="text-[13px] font-medium text-zinc-900">{p.symbol}</span>
+              <span className="font-mono text-[9px] uppercase tracking-wide text-zinc-400">{p.asset} · {p.strategy}</span>
+            </div>
+            <div><span className={`rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] ${STATE_TONE[p.state]}`}>{p.state.replace(/_/g, " ")}</span></div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.qty ? p.qty.toLocaleString() : <span className="text-zinc-300">flat</span>}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.entry}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-800">{p.last}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.offset}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.slPct}%</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-800">{p.qty ? fmtUsd(p.last * p.qty) : <span className="text-zinc-300">—</span>}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums">{p.pnl ? <Money value={p.pnl} /> : <span className="text-zinc-300">—</span>}</div>
+
+            {/* hover actions */}
+            <div onClick={(e) => e.stopPropagation()} className="absolute inset-y-1 right-1 flex items-center gap-1 rounded-lg bg-gradient-to-l from-zinc-50 via-zinc-50 to-transparent pl-10 pr-1 opacity-0 transition-opacity group-hover:opacity-100">
+              {p.qty ? <RowAct tone="red" onClick={() => onAction?.(p, "Square off")}>Square&nbsp;off</RowAct> : null}
+              <RowAct tone="amber" onClick={() => onAction?.(p, "Cancel orders")}>Cancel</RowAct>
+              <RowAct tone="zinc" onClick={() => onAction?.(p, "Modify stop")}>Modify</RowAct>
+              <RowAct tone="dark" onClick={() => onPick?.(p)}>Details</RowAct>
+            </div>
+          </div>
+        ))}
+        {rows.length === 0 && <div className="py-8 text-center font-mono text-[11px] text-zinc-400">No {asset.toLowerCase()} positions.</div>}
+      </div>
+    </Card>
+  );
+}
+
+// ── net-position step chart (the POSITION plot) ─────────────────────────────
+function PositionChart({ series }) {
+  const axis = { tick: { fontSize: 10, fill: "#a1a1aa", fontFamily: "JetBrains Mono" }, tickLine: false };
+  return (
+    <div className="h-[190px] w-full">
+      <ResponsiveContainer>
+        <ComposedChart data={series} margin={{ top: 8, right: 10, bottom: 0, left: 0 }}>
+          <defs>
+            <linearGradient id="posf" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#4f46e5" stopOpacity="0.14" />
+              <stop offset="100%" stopColor="#4f46e5" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          <XAxis dataKey="timestamp" {...axis} axisLine={{ stroke: "#e4e4e7" }} />
+          <YAxis orientation="right" width={46} {...axis} axisLine={false} />
+          <ReferenceLine y={0} stroke="#d4d4d8" />
+          <Tooltip content={<ChartTip />} />
+          <Area type="stepAfter" dataKey="pos" name="Net position" stroke="#4f46e5" strokeWidth={1.4} fill="url(#posf)" isAnimationActive={false} />
+        </ComposedChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ── desk-wide recent fills (combined across all strategies) ─────────────────
+function RecentFills({ fills }) {
+  const tc = "grid grid-cols-[1.5fr_0.9fr_0.55fr_0.8fr_0.7fr_0.9fr_0.85fr_0.9fr] items-center gap-x-3";
+  return (
+    <Card title="Recent Fills" right={<span className="font-mono text-[10px] uppercase tracking-[0.16em] text-zinc-400">Desk-wide · {fills.length} · GST</span>}>
+      <div className={`${tc} mb-2 border-b border-zinc-100 pb-2 text-[9px] font-mono uppercase tracking-[0.16em] text-zinc-400`}>
+        <span>Time · GST</span><span>Symbol</span><span>Side</span><span>Type</span><span className="text-right">Qty</span><span className="text-right">Price</span><span className="text-right">Comm</span><span className="text-right">P&L</span>
+      </div>
+      <div className="divide-y divide-zinc-100">
+        {fills.map((f, i) => (
+          <div key={i} className={`${tc} py-2 font-mono text-[12px] tabular-nums transition-colors hover:bg-zinc-50`}>
+            <span className="text-zinc-500">{fmtDubai(f.ts)}</span>
+            <span><span className="font-sans text-[12px] font-medium text-zinc-900">{f.symbol}</span> <span className="text-[9px] uppercase text-zinc-400">{f.asset}</span></span>
+            <span className={f.side === "BUY" ? "font-medium text-emerald-600" : "font-medium text-red-600"}>{f.side}</span>
+            <span className="text-[10px] uppercase tracking-wide text-zinc-500">{f.type}</span>
+            <span className="text-right text-zinc-600">{f.qty.toLocaleString()}</span>
+            <span className="text-right text-zinc-800">{f.price}</span>
+            <span className="text-right text-zinc-500">${f.commission.toFixed(2)}</span>
+            <span className="text-right">{f.pnl ? <Money value={f.pnl} /> : <span className="text-zinc-300">—</span>}</span>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+// ── desk-wide working orders (resting bracket legs) ─────────────────────────
+function WorkingOrders({ rows }) {
+  const tc = "grid grid-cols-[1.3fr_0.6fr_1.2fr_0.7fr_0.9fr_0.9fr] items-center gap-x-3";
+  return (
+    <Card title="Working Orders" right={<span className="font-mono text-[10px] uppercase tracking-[0.16em] text-zinc-400">{rows.length} resting at broker</span>}>
+      <div className={`${tc} mb-2 border-b border-zinc-100 pb-2 text-[9px] font-mono uppercase tracking-[0.16em] text-zinc-400`}>
+        <span>Symbol</span><span>Side</span><span>Type</span><span className="text-right">Qty</span><span className="text-right">Price</span><span className="text-right">Status</span>
+      </div>
+      <div className="divide-y divide-zinc-100">
+        {rows.map((o, i) => (
+          <div key={i} className={`${tc} py-2 font-mono text-[12px] tabular-nums transition-colors hover:bg-zinc-50`}>
+            <span><span className="font-sans text-[12px] font-medium text-zinc-900">{o.symbol}</span> <span className="text-[9px] uppercase text-zinc-400">{o.asset}</span></span>
+            <span className={o.side === "BUY" ? "font-medium text-emerald-600" : "font-medium text-red-600"}>{o.side}</span>
+            <span className="text-[10px] uppercase tracking-wide text-zinc-500">{o.type} <span className="text-zinc-300">· {o.note}</span></span>
+            <span className="text-right text-zinc-600">{o.qty.toLocaleString()}</span>
+            <span className="text-right text-zinc-800">{o.price}</span>
+            <span className="flex justify-end">
+              <span className={`rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] ${o.status === "Working" ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-amber-300 bg-amber-100 text-amber-700"}`}>{o.status}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+// ── system logs (dark terminal panel: sandbox · algorithm · trader data) ─────
+const LOGS = {
+  sandbox: [
+    { t: "15:42:01", cls: "text-zinc-300", msg: "[BROKER] bracket placed NVDA parent#3021 stp-lmt 391.20/391.15 child#3022 stp 389.65" },
+    { t: "15:42:01", cls: "text-emerald-400", msg: "[FILL] NVDA BUY 100 @ 391.17 comm $1.10 slippage +0.3bp" },
+    { t: "15:42:03", cls: "text-zinc-300", msg: "[STATE] NVDA MONITORING → IN_POSITION cycle=3" },
+    { t: "15:44:12", cls: "text-amber-400", msg: "[GUARD] AAPL trigger mismatch on saved state — refused re-arm, kept 312.75" },
+    { t: "15:45:22", cls: "text-zinc-300", msg: "[RECONCILE] 20/20 engines · ledger merged · 0 phantom" },
+    { t: "15:46:40", cls: "text-emerald-400", msg: "[FILL] IBUS500 SELL 1 @ 7551.44 (short entry) comm $0.90" },
+    { t: "15:48:09", cls: "text-red-400", msg: "[GUARD] AMD phantom BUY-cover rejected — engine FLAT, orphan child ignored" },
+    { t: "15:49:55", cls: "text-zinc-300", msg: "[BROKER] child stop trailed NVDA 389.65 → 390.10" },
+  ],
+  algo: [
+    { t: "15:42:00", cls: "text-zinc-300", msg: "long_breakout(NVDA): breakout confirmed above 391.10, arming stop-limit" },
+    { t: "15:43:30", cls: "text-zinc-300", msg: "short_breakout(MSFT): breakdown below 385.30, protective BUY-cover set" },
+    { t: "15:45:00", cls: "text-zinc-400", msg: "long_breakout(META): monitoring — 0.4% below trigger, no signal" },
+    { t: "15:46:38", cls: "text-zinc-300", msg: "short_breakout(IBUS500): breakdown fired, trough tracking engaged" },
+    { t: "15:47:10", cls: "text-amber-400", msg: "risk: BP utilisation 37.4% — within 90% cap, no throttle" },
+    { t: "15:48:44", cls: "text-zinc-300", msg: "long_breakout(GOOGL): stopped out, WAITING_REENTRY armed at 364.20" },
+    { t: "15:50:02", cls: "text-zinc-400", msg: "session: RTH open · 15 strategies active · 8 in position" },
+  ],
+  trader: [
+    { t: "15:50:10", cls: "text-zinc-400", msg: '{ "session": "GT-DESK-0708", "account": "DU-paper", "strategies": 15 }' },
+    { t: "15:50:10", cls: "text-zinc-300", msg: '{ "NVDA":  { "pos": 100, "entry": 391.17, "stop": 390.10, "cycle": 3 } }' },
+    { t: "15:50:10", cls: "text-zinc-300", msg: '{ "MSFT":  { "pos": -100, "entry": 385.27, "stop": 386.90, "cycle": 2 } }' },
+    { t: "15:50:10", cls: "text-zinc-300", msg: '{ "IBUS500": { "pos": -1, "entry": 7551.44, "stop": 7580.0, "cycle": 1 } }' },
+    { t: "15:50:10", cls: "text-zinc-400", msg: '{ "ledger": { "fills_today": 47, "comm_today": 68.40, "net_pnl": 4591 } }' },
+    { t: "15:50:10", cls: "text-zinc-400", msg: '{ "reconcile": { "engine": "ok", "broker": "ok", "market": "ok" } }' },
+  ],
+};
+function SystemLogs() {
+  const [tab, setTab] = useState("sandbox");
+  const tabs = [
+    { id: "sandbox", label: "Sandbox Logs", icon: ">_" },
+    { id: "algo", label: "Algorithm Logs", icon: "▦" },
+    { id: "trader", label: "Trader Data", icon: "</>" },
+  ];
+  return (
+    <div className="overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900 shadow-sm">
+      <div className="flex items-center gap-1 border-b border-zinc-800 bg-zinc-950/40 px-3 py-2">
+        {tabs.map((t) => (
+          <button key={t.id} onClick={() => setTab(t.id)} className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.14em] transition-colors ${tab === t.id ? "bg-zinc-800 text-white" : "text-zinc-500 hover:text-zinc-300"}`}>
+            <span className="font-mono text-zinc-500">{t.icon}</span>{t.label}
+          </button>
+        ))}
+        <span className="ml-auto font-mono text-[10px] uppercase tracking-[0.14em] text-zinc-600">live · GST</span>
+      </div>
+      <div className="max-h-[260px] overflow-auto px-4 py-3">
+        {LOGS[tab].map((l, i) => (
+          <div key={i} className="flex gap-3 py-0.5 font-mono text-[11.5px] leading-relaxed">
+            <span className="shrink-0 text-zinc-600">{l.t}</span>
+            <span className={l.cls}>{l.msg}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── order ticket (the MD's key action) ──────────────────────────────────────
+function OrderTicket({ order, setOrder, fromSymbol, onClear }) {
+  const [placed, setPlaced] = useState(null);
+  // HER-style strategy dropdown open state for New Order only
+  const [strategyDropdownOpen, setStrategyDropdownOpen] = useState(false);
+  // Close strategy dropdown on click-out
+  useEffect(() => {
+    if (!strategyDropdownOpen) return;
+    function onDocClick(e) {
+      if (!e.target.closest('.her-strat-dropdown')) setStrategyDropdownOpen(false);
+    }
+    document.addEventListener('mousedown', onDocClick, true);
+    return () => document.removeEventListener('mousedown', onDocClick, true);
+  }, [strategyDropdownOpen]);
+  const set = (k, v) => setOrder((o) => ({ ...o, [k]: v }));
+  const {
+    mode = "STRATEGY", strategyId = "long_breakout", asset, symbol, qty, value,
+    sizeMode = "QTY", trigger, stop, offset, orderType = "MKT", limitPrice, stopPrice, tif = "DAY",
+  } = order;
+  const strat = STRATEGIES.find((s) => s.id === strategyId) ?? STRATEGIES[0];
+  const needsLimit = orderType === "LMT" || orderType === "STP LMT";
+  const needsStop = orderType === "STP" || orderType === "STP LMT";
+  const sizeLabel = sizeMode === "QTY" ? `${qty} units` : `$${Number(value || 0).toLocaleString()}`;
+
+  function place() {
+    const label = mode === "STRATEGY"
+      ? `${strat.name} · ${symbol} · ${sizeLabel}`
+      : `${mode} ${sizeLabel} ${symbol} @ ${orderType}`;
+    setPlaced(label);
+    notify("success", `Order sent · ${label}`);
+    setTimeout(() => setPlaced(null), 2600);
+  }
+
+  const field = "w-full rounded-xl border border-zinc-200 bg-white px-3 py-2.5 font-mono text-[14px] tabular-nums text-zinc-900 outline-none transition-colors focus:border-zinc-400";
+  const seg = "mt-1.5 inline-flex w-full gap-1 rounded-full border border-zinc-200 bg-zinc-50 p-1";
+  const segBtn = (on, tone) => `flex-1 rounded-full px-2 py-1.5 text-[10px] font-bold uppercase tracking-[0.1em] transition-colors ${on ? tone : "text-zinc-500 hover:text-zinc-900"}`;
+  // plain functions (NOT components) so inputs don't remount + lose focus on keystroke
+  const fld = (label, k) => (
+    <div><Label>{label}</Label><input value={order[k] ?? ""} onChange={(e) => set(k, e.target.value)} className={`${field} mt-1.5`} /></div>
+  );
+  // Size input with a QTY / $ VALUE toggle — enter shares/units OR a dollar notional.
+  const sizeField = () => (
+    <div>
+      <div className="flex items-center justify-between">
+        <Label>Size</Label>
+        <div className="inline-flex gap-0.5 rounded-full border border-zinc-200 bg-zinc-50 p-0.5">
+          {[["QTY", "Qty"], ["VALUE", "$ Value"]].map(([v, lbl]) => (
+            <button key={v} onClick={() => set("sizeMode", v)} className={`rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${sizeMode === v ? "bg-zinc-900 text-white" : "text-zinc-400 hover:text-zinc-700"}`}>{lbl}</button>
+          ))}
+        </div>
+      </div>
+      <div className="mt-1.5 flex items-center rounded-xl border border-zinc-200 bg-white transition-colors focus-within:border-zinc-400">
+        {sizeMode === "VALUE" && <span className="pl-3 font-mono text-[14px] text-zinc-400">$</span>}
+        <input value={sizeMode === "QTY" ? qty : value} onChange={(e) => set(sizeMode === "QTY" ? "qty" : "value", e.target.value)} className="w-full bg-transparent px-3 py-2.5 font-mono text-[14px] tabular-nums text-zinc-900 outline-none" />
+        <span className="pr-3 font-mono text-[9px] uppercase tracking-wide text-zinc-400">{sizeMode === "QTY" ? "units" : "USD"}</span>
+      </div>
+    </div>
+  );
+  // Field with a % / VAL unit toggle — for Stop, Offset, etc.
+  const unitField = (label, valKey, unitKey) => {
+    const u = order[unitKey] ?? "PCT";
+    return (
+      <div>
+        <div className="flex items-center justify-between">
+          <Label>{label}</Label>
+          <div className="inline-flex gap-0.5 rounded-full border border-zinc-200 bg-zinc-50 p-0.5">
+            {[["PCT", "%"], ["ABS", "Val"]].map(([v, lbl]) => (
+              <button key={v} onClick={() => set(unitKey, v)} className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${u === v ? "bg-zinc-900 text-white" : "text-zinc-400 hover:text-zinc-700"}`}>{lbl}</button>
+            ))}
+          </div>
+        </div>
+        <div className="mt-1.5 flex items-center rounded-xl border border-zinc-200 bg-white transition-colors focus-within:border-zinc-400">
+          <input value={order[valKey] ?? ""} onChange={(e) => set(valKey, e.target.value)} className="w-full bg-transparent px-3 py-2.5 font-mono text-[14px] tabular-nums text-zinc-900 outline-none" />
+          <span className="pr-3 font-mono text-[10px] text-zinc-400">{u === "PCT" ? "%" : "abs"}</span>
+        </div>
+      </div>
+    );
+  };
+
+  const cta = mode === "BUY"
+    ? { cls: "bg-emerald-600 shadow-emerald-200 hover:bg-emerald-700", label: `Buy ${symbol}` }
+    : mode === "SELL"
+    ? { cls: "bg-red-600 shadow-red-200 hover:bg-red-700", label: `Sell ${symbol}` }
+    : { cls: "bg-zinc-900 shadow-zinc-200 hover:bg-zinc-800", label: `Deploy ${strat.name} · ${symbol}` };
+
+  return (
+    <Card
+      title="New Order"
+      subtitle={fromSymbol ? `Loaded from ${fromSymbol} position` : "Place from anywhere · paper account"}
+      right={fromSymbol ? (
+        <button onClick={onClear} className="rounded-full border border-zinc-200 bg-white px-2.5 py-1 text-[9px] font-bold uppercase tracking-[0.14em] text-zinc-400 transition-colors hover:border-zinc-400 hover:text-zinc-700">Clear</button>
+      ) : null}
+    >
+      <div className="space-y-3.5">
+        {/* mode: Strategy only, no Buy/Sell */}
+        <div className={seg}>
+          <button onClick={() => set("mode", "STRATEGY")} className={segBtn(true, "bg-zinc-900 text-white")}>
+            STRATEGY
+          </button>
+        </div>
+
+        {/* Strategy selection - HER-style dropdown at top */}
+        <div className="her-strat-dropdown relative mb-3">
+          <Label>Strategy</Label>
+          <button
+            type="button"
+            className={`rounded-full border px-3 py-1.5 pr-7 text-[10px] font-bold uppercase tracking-[0.16em] transition-colors font-mono flex items-center w-full min-w-[130px] mt-1.5
+              bg-white text-zinc-900 border-zinc-300 focus:border-zinc-400 hover:border-zinc-400`}
+
+            onClick={e => {
+              e.preventDefault();
+              setStrategyDropdownOpen(s => !s);
+            }}
+            aria-haspopup="listbox"
+            aria-expanded={strategyDropdownOpen ? 'true' : 'false'}
+            style={{ position: 'relative' }}
+          >
+            {strat.name}
+            <svg
+              className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-400 pointer-events-none"
+              fill="none" viewBox="0 0 14 14"
+              stroke="currentColor" strokeWidth="2"
+              aria-hidden="true"
+            >
+              <path d="M4 6l3 3 3-3" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+          {strategyDropdownOpen && (
+            <div
+              className="absolute left-0 z-50 mt-2 w-full max-h-48 overflow-y-auto rounded-xl border border-zinc-200 bg-white shadow-xl animate-fadeIn"
+              style={{ minWidth: 140 }}
+              onBlur={() => setStrategyDropdownOpen(false)}
+              tabIndex={0}
+            >
+              {STRATEGIES.map(s => (
+                <button
+                  key={s.id}
+                  className={`block w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-[0.16em] font-bold transition-colors rounded ${strategyId === s.id ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900"}`}
+                  onClick={() => {
+                    set("strategyId", s.id);
+                    setStrategyDropdownOpen(false);
+                  }}
+                >
+                  {s.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        {/* asset + symbol (common) */}
+        <div>
+          <Label>Asset</Label>
+          <div className={seg}>
+            {["EQUITY", "FX", "CFD"].map((v) => (
+              <button key={v} onClick={() => set("asset", v)} className={segBtn(asset === v, "bg-zinc-900 text-white")}>{v}</button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <Label>Symbol</Label>
+          <input value={symbol} onChange={(e) => set("symbol", e.target.value.toUpperCase())} className={`${field} mt-1.5 uppercase`} />
+        </div>
+
+        {mode === "STRATEGY" ? (
+          <>
+            <div className="her-strat-dropdown relative">
+              <Label>Strategy</Label>
+              <button
+                type="button"
+                className={`rounded-full border px-3 py-1.5 pr-7 text-[10px] font-bold uppercase tracking-[0.16em] transition-colors font-mono flex items-center w-full min-w-[130px] mt-1.5
+                  bg-white text-zinc-500 border-zinc-200 hover:text-zinc-900 hover:border-zinc-400`}
+                onClick={e => {
+                  e.preventDefault();
+                  setStrategyDropdownOpen(s => !s);
+                }}
+                aria-haspopup="listbox"
+                aria-expanded={strategyDropdownOpen ? 'true' : 'false'}
+                style={{ position: 'relative' }}
+              >
+                {strat.name}
+                <svg
+                  className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-400 pointer-events-none"
+                  fill="none" viewBox="0 0 14 14"
+                  stroke="currentColor" strokeWidth="2"
+                  aria-hidden="true"
+                >
+                  <path d="M4 6l3 3 3-3" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+              {strategyDropdownOpen && (
+                <div
+                  className="absolute left-0 z-50 mt-2 w-full max-h-48 overflow-y-auto rounded-xl border border-zinc-200 bg-white shadow-xl animate-fadeIn"
+                  style={{ minWidth: 140 }}
+                  onBlur={() => setStrategyDropdownOpen(false)}
+                  tabIndex={0}
+                >
+                  {STRATEGIES.map(s => (
+                    <button
+                      key={s.id}
+                      className={`block w-full text-left px-4 py-2 text-[10px] font-mono uppercase tracking-[0.16em] font-bold transition-colors rounded ${strategyId === s.id ? "bg-zinc-900 text-white" : "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900"}`}
+                      onClick={() => {
+                        set("strategyId", s.id);
+                        setStrategyDropdownOpen(false);
+                      }}
+                    >
+                      {s.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {sizeField()}
+            {fld("Trigger", "trigger")}
+            <div className="grid grid-cols-2 gap-2">
+              {unitField("Stop", "stop", "stopUnit")}
+              {unitField("Offset", "offset", "offsetUnit")}
+            </div>
+            <div className="rounded-xl border border-zinc-100 bg-zinc-50 px-3.5 py-2.5 font-mono text-[11px] leading-relaxed text-zinc-500">
+              <span className={strat.side === "LONG" ? "text-emerald-700" : "text-red-700"}>{strat.desc}</span> · trigger {trigger || "—"} · stop {stop}{order.stopUnit === "PCT" ? "%" : ""} · offset {offset}{order.offsetUnit === "PCT" ? "%" : ""}
+            </div>
+          </>
+        ) : (
+          <>
+            <div>
+              <Label>Order Type</Label>
+              <div className={seg}>
+                {["MKT", "LMT", "STP", "STP LMT"].map((v) => (
+                  <button key={v} onClick={() => set("orderType", v)} className={segBtn(orderType === v, "bg-zinc-900 text-white")}>{v}</button>
+                ))}
+              </div>
+            </div>
+            {sizeField()}
+            {(needsLimit || needsStop) && (
+              <div className="grid grid-cols-2 gap-2">
+                {needsLimit && fld("Limit", "limitPrice")}
+                {needsStop && fld("Stop Px", "stopPrice")}
+              </div>
+            )}
+            <div>
+              <Label>Time in Force</Label>
+              <div className={seg}>
+                {["DAY", "GTC", "IOC"].map((v) => (
+                  <button key={v} onClick={() => set("tif", v)} className={segBtn(tif === v, "bg-zinc-900 text-white")}>{v}</button>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-xl border border-zinc-100 bg-zinc-50 px-3.5 py-2.5 font-mono text-[11px] leading-relaxed text-zinc-500">
+              <span className={mode === "BUY" ? "text-emerald-700" : "text-red-700"}>{mode} {sizeLabel} {symbol}</span> @ {orderType === "MKT" ? "market" : orderType.toLowerCase()}
+              {needsLimit ? ` ${limitPrice}` : ""}{needsStop ? ` · stp ${stopPrice}` : ""} · {tif}
+            </div>
+          </>
+        )}
+
+        <button onClick={place} className={`flex w-full items-center justify-center rounded-2xl py-4 text-xs font-bold uppercase tracking-widest text-white shadow-xl transition-all active:scale-[0.99] ${cta.cls}`}>
+          {placed ? "Order Sent ✓" : cta.label}
+        </button>
+        {placed && <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-center font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-700">Working: {placed}</div>}
+      </div>
+    </Card>
+  );
+}
+
+// ── alerts feed ──────────────────────────────────────────────────────────────
+function Alerts({ alerts }) {
+  return (
+    <Card title="Activity" right={<span className="font-mono text-[10px] uppercase tracking-[0.16em] text-zinc-400">{alerts.length}</span>}>
+      <div className="space-y-px">
+        {alerts.map((a, i) => (
+          <div key={i} className="flex items-start gap-3 rounded-lg px-1 py-2.5 transition-colors hover:bg-zinc-50">
+            <span className={`mt-0.5 shrink-0 rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] ${SEV_TONE[a.sev]}`}>{a.sev}</span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[10px] font-bold uppercase tracking-[0.1em] text-zinc-600">{a.code}</span>
+                <span className="font-mono text-[10px] text-zinc-400">{a.symbol}</span>
+              </div>
+              <div className="truncate text-[12px] text-zinc-600">{a.msg}</div>
+            </div>
+            <span className="shrink-0 font-mono text-[10px] tabular-nums text-zinc-400">{a.ago}</span>
+          </div>
+        ))}
+      </div>
+    </Card>
+  );
+}

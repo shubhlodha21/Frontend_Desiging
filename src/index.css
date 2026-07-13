@@ -1,0 +1,33 @@
+/* Tailwind v4: one import replaces the old @tailwind base/components/utilities.
+   The theme is configured HERE in CSS, not in a JS config file. This mirrors
+   how the original Prosperity Visualizer defines its design tokens. */
+@import "tailwindcss";
+
+@theme {
+  /* Fonts — the two the original ships: a sans for prose, a mono for all data. */
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* The original leans entirely on zinc + a couple of data accents.
+     Defining them as tokens lets you swap the whole mood in one place. */
+  --color-up: oklch(0.696 0.17 162);   /* emerald-ish: gains  */
+  --color-down: oklch(0.637 0.208 25); /* red-ish: losses     */
+}
+
+/* App-wide base: the calm zinc canvas + mono-numeral default for a data UI. */
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  /* Her exact base — note the custom selection colors (a tiny "designed" touch). */
+  @apply bg-zinc-100 text-zinc-900 antialiased selection:bg-zinc-900 selection:text-white;
+  font-family: var(--font-sans);
+}
+
+/* Tabular figures stop numbers from jittering as they change — a small detail
+   that makes data tables and tooltips feel solid. */
+.font-mono {
+  font-variant-numeric: tabular-nums;
+}
