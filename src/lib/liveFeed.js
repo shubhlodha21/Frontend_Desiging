@@ -162,6 +162,27 @@ export async function submitLaunchIntent(order) {
   return r.json();
 }
 
-export async function fetchIntents() {
-  return getJSON("/api/launch-intents");
+export async function fetchIntents({ pendingOnly = false } = {}) {
+  return getJSON(`/api/launch-intents${pendingOnly ? "?pending_only=true" : ""}`);
 }
+
+// ── desk decisions (admin screen) ───────────────────────────────────────────
+// Both are one-shot server-side: deciding an already-decided intent returns 409
+// rather than re-opening a position the engine already holds. Callers surface
+// that as "someone else got there first" and refetch.
+async function decide(id, action, body) {
+  const r = await fetch(`/api/launch-intents/${id}/${action}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!r.ok) {
+    const err = new Error(`${action} → ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+
+export const approveIntent = (id) => decide(id, "approve");
+export const rejectIntent = (id, reason) => decide(id, "reject", { reason: reason || null });

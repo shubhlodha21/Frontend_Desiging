@@ -17,3 +17,11 @@ Thumbs.db
 # Local env
 .env
 .env.local
+
+# Python / backend
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+# Added by code-review-graph
+.code-review-graph/

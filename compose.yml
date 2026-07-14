@@ -1,0 +1,36 @@
+# Local Linux test rig — API + tmux in one container.
+#
+#   docker compose up --build          then http://localhost:8000/?admin=1
+#   docker compose exec api tmux attach -t gt     see the staged command
+#
+# GT_STAGING is set to "on" here on purpose: staging in a throwaway container is
+# exactly what this rig is for, and the container has no route to a real broker.
+# The default everywhere else stays "off".
+
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      GT_STAGING: "on"
+      GT_LONG_DIR: /srv/gt/long
+      GT_SHORT_DIR: /srv/gt/short
+      GT_TMUX_SESSION: gt
+      GT_DB_PATH: /data/gt_desk.db
+      GT_DIST_DIR: /app/dist
+    volumes:
+      # Live code edits without a rebuild.
+      - ./backend/app:/app/app:ro
+      # The built frontend, so :8000 serves the UI. Run `npm run build` first;
+      # without it the API still works, it just serves no pages.
+      - ./dist:/app/dist:ro
+      # DB on a named volume — inside the image it would die on every rebuild,
+      # taking the audit trail with it.
+      - gt-data:/data
+    # tmux wants a TTY; without these the server starts but new-window fails.
+    tty: true
+    stdin_open: true
+
+volumes:
+  gt-data:

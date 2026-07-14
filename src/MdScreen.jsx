@@ -119,6 +119,69 @@ export default function MdScreen() {
     notify(kind === "Modify stop" ? "info" : "warning", `${kind} · ${p.symbol}`);
   }
 
+  // ── launch approval: MD submits → desk signs off ────────────────────────
+  // Deploy does NOT place an order: it files an intent that sits
+  // PENDING_APPROVAL until an admin decides (backend/app/routers/intents.py).
+  const [pending, setPending] = useState([]);
+
+  async function handlePlaced({ symbol, label }) {
+    try {
+      const rec = await submitLaunchIntent(order);
+      setPending((l) =>
+        [{ id: rec.id, at: Date.parse(rec.created_at) || Date.now(), symbol: rec.symbol, label, status: "PENDING" }, ...l].slice(0, 8),
+      );
+    } catch (e) {
+      // Surface the real reason — silently dropping a deploy the MD believes
+      // was sent is worse than a failed toast, and "desk offline" for what is
+      // actually "trigger is 0" sends you debugging the wrong thing.
+      notify("warning", `${symbol} · ${e?.message || "submit failed"}`);
+    }
+  }
+
+  // The backend owns the queue whenever it's up; poll for the desk's decision.
+  // Shows pending + anything decided in the last 8s, so the outcome lands
+  // visibly and then clears.
+  const seenRef = useRef({}); // id → last status, for spotting the transition
+  useEffect(() => {
+    let alive = true;
+    async function poll() {
+      try {
+        const intents = await fetchIntents();
+        if (!alive) return;
+        const now = Date.now();
+        const mapped = intents
+          .filter((i) => i.status === "PENDING_APPROVAL" || (i.decided_at && now - Date.parse(i.decided_at) < 8000))
+          .slice(0, 8)
+          .map((i) => ({
+            id: i.id,
+            at: Date.parse(i.created_at),
+            symbol: i.symbol,
+            label: `${i.side === "SHORT" ? "Short" : "Long"} Breakout · ${i.symbol} · ${i.qty} units`,
+            status: i.status === "PENDING_APPROVAL" ? "PENDING"
+              : (i.status === "APPROVED" || i.status === "LAUNCHED") ? "APPROVED" : "REJECTED",
+          }));
+
+        // Announce the moment the desk decides. The card alone is passive — and
+        // a decision arrives while the MD is likely looking at another panel.
+        // A rejection especially must not pass unnoticed.
+        for (const o of mapped) {
+          if (seenRef.current[o.id] === "PENDING" && o.status !== "PENDING") {
+            notify(
+              o.status === "APPROVED" ? "success" : "warning",
+              `${o.status === "APPROVED" ? "Approved" : "Declined"} by desk · ${o.symbol}`,
+            );
+          }
+          seenRef.current[o.id] = o.status;
+        }
+
+        setPending(mapped);
+      } catch { /* desk offline — keep whatever we have */ }
+    }
+    poll();
+    const iv = setInterval(poll, 3000);
+    return () => { alive = false; clearInterval(iv); };
+  }, []);
+
   const [assetFilter, setAssetFilter] = useState("ALL");
   const shown = useMemo(
     () => (assetFilter === "ALL" ? positions : positions.filter((p) => p.asset === assetFilter)),
@@ -206,7 +269,19 @@ export default function MdScreen() {
             </div>
 
             <div className="space-y-5" ref={ticketRef}>
-              <OrderTicket order={order} setOrder={setOrder} fromSymbol={selected} onClear={() => setSelected(null)} />
+              {/* Everything, not just PENDING: the poller keeps decided items for
+                  8s so the outcome lands visibly before it clears. Filtering to
+                  PENDING here made approve and reject look identical — the row
+                  just vanished, which reads as "sent". */}
+              <PendingApproval items={pending} />
+              <OrderTicket
+                order={order}
+                setOrder={setOrder}
+                fromSymbol={selected}
+                onClear={() => setSelected(null)}
+                onPlaced={handlePlaced}
+                approval
+              />
               <Alerts alerts={alerts} />
             </div>
           </div>
@@ -942,31 +1017,71 @@ function DynamicIsland({ items }) {
 }
 
 // ── persistent "awaiting approval" queue — real desk sign-off has a delay ────
+// `ms` is the submit time. Guard the non-finite case: the backend's id is a
+// UUID, so anything passing an id here (as the demo once did) would render NaN.
 function fmtWait(ms) {
-  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  const s = Number.isFinite(ms) ? Math.max(0, Math.floor((Date.now() - ms) / 1000)) : 0;
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
+// Per-status row chrome. The MD must be able to tell approval from rejection at
+// a glance — before this, both simply removed the row, which read as "sent".
+const APPROVAL_ROW = {
+  PENDING: {
+    tone: "text-amber-600",
+    note: "Submitted · not yet confirmed by desk",
+  },
+  APPROVED: {
+    tone: "text-emerald-600",
+    note: "Approved by desk · launching",
+  },
+  REJECTED: {
+    tone: "text-red-600",
+    note: "Declined by desk · not sent",
+  },
+};
+
+// Shows what the desk did with your submissions. Accepts PENDING *and* decided
+// items: the caller decides how much to pass (the desktop passes everything,
+// mobile passes only PENDING because its DynamicIsland covers the outcomes).
 function PendingApproval({ items }) {
   if (!items.length) return null;
+  const waiting = items.filter((o) => o.status === "PENDING").length;
+  // Amber only while something is genuinely outstanding; a card showing nothing
+  // but finished decisions shouldn't still look like it's waiting.
+  const live = waiting > 0;
+  const shell = live ? "border-amber-300 bg-amber-50" : "border-zinc-200 bg-white";
+  const head = live ? "border-amber-200/70" : "border-zinc-100";
+
   return (
-    <div className="overflow-hidden rounded-2xl border border-amber-300 bg-amber-50 shadow-sm">
-      <div className="flex items-center justify-between border-b border-amber-200/70 px-4 py-2.5">
+    <div className={`overflow-hidden rounded-2xl border shadow-sm ${shell}`}>
+      <div className={`flex items-center justify-between border-b px-4 py-2.5 ${head}`}>
         <div className="flex items-center gap-2">
-          <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-amber-300 border-t-amber-600" />
-          <span className="text-[10px] font-bold uppercase tracking-[0.16em] text-amber-700">Awaiting Desk Approval</span>
+          {live && <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-amber-300 border-t-amber-600" />}
+          <span className={`text-[10px] font-bold uppercase tracking-[0.16em] ${live ? "text-amber-700" : "text-zinc-500"}`}>
+            {live ? "Awaiting Desk Approval" : "Desk Decision"}
+          </span>
         </div>
-        <span className="font-mono text-[10px] tabular-nums text-amber-700">{items.length}</span>
+        {live && <span className="font-mono text-[10px] tabular-nums text-amber-700">{waiting}</span>}
       </div>
-      <div className="divide-y divide-amber-200/60">
-        {items.map((o) => (
-          <div key={o.id} className="flex items-center gap-3 px-4 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2"><span className="text-[13px] font-semibold text-zinc-900">{o.symbol}</span><span className="truncate font-mono text-[10px] text-zinc-500">{o.label}</span></div>
-              <div className="font-mono text-[9px] uppercase tracking-[0.14em] text-amber-600">Submitted · not yet confirmed by desk</div>
+      <div className={`divide-y ${live ? "divide-amber-200/60" : "divide-zinc-100"}`}>
+        {items.map((o) => {
+          const row = APPROVAL_ROW[o.status] ?? APPROVAL_ROW.PENDING;
+          return (
+            <div key={o.id} className="flex items-center gap-3 px-4 py-2.5">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] font-semibold text-zinc-900">{o.symbol}</span>
+                  <span className="truncate font-mono text-[10px] text-zinc-500">{o.label}</span>
+                </div>
+                <div className={`font-mono text-[9px] uppercase tracking-[0.14em] ${row.tone}`}>{row.note}</div>
+              </div>
+              {/* The wait timer only means something while still waiting. */}
+              {o.status === "PENDING" && (
+                <span className="shrink-0 font-mono text-[11px] tabular-nums text-amber-700">{fmtWait(o.at)}</span>
+              )}
             </div>
-            <span className="shrink-0 font-mono text-[11px] tabular-nums text-amber-700">{fmtWait(o.id)}</span>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -998,10 +1113,10 @@ export function MdMobile() {
     setSheet(false);
     try {
       const rec = await submitLaunchIntent(order);
-      setPending((list) => [{ id: rec.id, symbol: rec.symbol, label, status: "PENDING" }, ...list].slice(0, 8));
+      setPending((list) => [{ id: rec.id, at: Date.parse(rec.created_at) || Date.now(), symbol: rec.symbol, label, status: "PENDING" }, ...list].slice(0, 8));
     } catch {
       const id = String(Date.now());
-      setPending((list) => [{ id, symbol, label, status: "PENDING" }, ...list].slice(0, 8));
+      setPending((list) => [{ id, at: Number(id), symbol, label, status: "PENDING" }, ...list].slice(0, 8));
       setTimeout(() => {
         setPending((list) => list.map((o) => (o.id === id ? { ...o, status: "APPROVED" } : o)));
         notify("success", `Desk approved · ${symbol}`);
@@ -1025,6 +1140,7 @@ export function MdMobile() {
           .slice(0, 8)
           .map((i) => ({
             id: i.id,
+            at: Date.parse(i.created_at),
             symbol: i.symbol,
             label: `${i.side === "SHORT" ? "Short" : "Long"} Breakout · ${i.symbol} · ${i.qty} units`,
             status: i.status === "PENDING_APPROVAL" ? "PENDING"
