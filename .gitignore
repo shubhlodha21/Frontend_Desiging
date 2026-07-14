@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Vite cache
+.vite/
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+
+# Syncthing temp files
+.syncthing.*.tmp
+
+# Local env
+.env
+.env.local
