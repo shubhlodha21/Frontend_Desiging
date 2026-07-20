@@ -96,8 +96,12 @@ def build_command(intent: LaunchIntent) -> str:
     if intent.client_id is None:
         raise StagingError("client_id must be allocated before building the command")
 
+    # GT_PAPER=false ALWAYS = "route real orders to the IBKR gateway" (not the
+    # engine's internal simulation). The paper-vs-live account is chosen by the
+    # PORT, not this flag: port_for(paper=True) → 7497 (paper account),
+    # paper=False → 7496 (live). So a paper intent = GT_PAPER=false + port 7497.
     parts: list[str] = [
-        f"GT_PAPER={'true' if intent.paper else 'false'}",
+        "GT_PAPER=false",
         config.PYTHON_BIN,
         config.RUN_SCRIPT,
         shlex.quote(intent.symbol),
@@ -229,12 +233,16 @@ def stage(intent: LaunchIntent) -> Staged:
     last_seen = ""
     for attempt in (1, 2):
         _tmux("send-keys", "-t", target, "C-u")
-        # NO trailing "Enter" — this types the line and leaves it on the prompt.
-        # Adding "Enter" here would fire a live order with no human in the loop.
+        # Type the line, verify it landed intact, THEN press Enter to run it.
+        # The human-in-the-loop is the admin's Approve click itself — approving
+        # on the desk screen *is* the deliberate act, so the command auto-runs
+        # (yellow "pending" → running). We still verify the line before Enter so
+        # a mangled paste can never execute.
         r = _tmux("send-keys", "-t", target, command)
         if r.returncode != 0:
             raise StagingError(f"tmux send-keys failed: {r.stderr.strip()}")
         if _prompt_holds(target, command):
+            _tmux("send-keys", "-t", target, "Enter")   # approve = launch
             return Staged(command=command, window=window, mode="on")
         cap = _tmux("capture-pane", "-p", "-J", "-t", target)
         last_seen = _normalise(cap.stdout)[-200:]
