@@ -112,6 +112,8 @@ class RejectBody(BaseModel):
 
 class SnapshotState(BaseModel):
     entry_price: float = 0
+    trigger_price: float = 0
+    cycle_seq: int = 1
     stop_loss: float = 0
     quantity: int = 0
     pnl: float = 0
@@ -137,8 +139,25 @@ class SnapshotLive(BaseModel):
     bp_used_pct: float = 0
 
 
+class Protective(BaseModel):
+    """The resting protective exit order (SELL for a long, BUY-cover for a
+    short), read from the engine's `pending_stop`. Auto-updates as the engine
+    modifies it after a fill (trailed stop / promoted bracket child)."""
+    order_id: str = ""
+    side: str = ""
+    order_type: str = ""
+    stop_price: float = 0
+    limit_price: float | None = None
+    qty: int = 0
+
+
 class SymbolSnapshot(BaseModel):
     symbol: str
+    client_id: int = 0          # IBKR client-id — targets the exact bot for cancel
+    side: str = "LONG"          # LONG | SHORT — from the source deployment dir
     spread_bps: float = 0
+    offset: float = 0           # launch-time entry offset (--offset-entry-pct etc.)
+    offset_kind: str = ""       # entry_pct | stop_fraction | sl_limit | fixed
+    protective: Protective | None = None
     state: SnapshotState
     live: SnapshotLive

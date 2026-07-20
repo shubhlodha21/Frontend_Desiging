@@ -21,7 +21,7 @@ from .db import engine as db_engine
 from .db import init_db
 from .engine import engine
 from .hub import hub
-from .routers import intents, snapshot, ws
+from .routers import control, fills, history, intents, snapshot, ws
 
 TICK_SECONDS = 1.0
 
@@ -70,6 +70,9 @@ app.add_middleware(
 app.include_router(intents.router)
 app.include_router(snapshot.router)
 app.include_router(ws.router)
+app.include_router(fills.router)
+app.include_router(history.router)
+app.include_router(control.router)
 
 
 @app.get("/api/health")

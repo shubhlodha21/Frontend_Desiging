@@ -5,7 +5,7 @@
 // controls, zinc palette + JetBrains-Mono data, accents ONLY for status.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { generateMdData } from "./lib/mdData.js";
-import { useMdData, submitLaunchIntent, fetchIntents } from "./lib/liveFeed.js";
+import { useMdData, submitLaunchIntent, fetchIntents, fetchFills, fetchHistory, cancelPosition } from "./lib/liveFeed.js";
 import { PnlChart } from "./components/Charts.jsx";
 import { Card, Money, Chip, Label } from "./components/ui.jsx";
 import { ComposedChart, Area, Scatter, XAxis, YAxis, ReferenceLine, Tooltip, ResponsiveContainer } from "recharts";
@@ -90,7 +90,7 @@ function sess() {
 }
 
 export default function MdScreen() {
-  const [data, setData] = useState(() => generateMdData());
+  const data = useMdData(); // live backend when up, demo otherwise
   const { account, pnl_series, position_series, positions, alerts } = data;
   const marker = pnl_series.at(-1).timestamp;
   const ticketRef = useRef(null);
@@ -99,7 +99,7 @@ export default function MdScreen() {
   const [order, setOrder] = useState({
     mode: "STRATEGY", strategyId: "long_breakout", asset: "EQUITY", symbol: "NVDA",
     qty: "100", value: "10000", sizeMode: "QTY", trigger: "0",
-    stop: "0.05", stopUnit: "PCT", offset: "0.05", offsetUnit: "ABS",
+    stop: "0.5", stopUnit: "PCT", offset: "0.5", offsetUnit: "PCT",
     orderType: "MKT", limitPrice: "0", stopPrice: "0", tif: "DAY",
   });
   const [selected, setSelected] = useState(null);
@@ -107,7 +107,7 @@ export default function MdScreen() {
     setOrder((o) => ({
       ...o, mode: "STRATEGY",
       strategyId: p.strategy === "SHORT" ? "short_breakout" : "long_breakout",
-      asset: p.asset, symbol: p.symbol, qty: String(p.qty || 100), trigger: String(p.last), stop: "0.05",
+      asset: p.asset, symbol: p.symbol, qty: String(p.qty || 100), trigger: String(p.last), stop: "0.5",
     }));
     setSelected(p.symbol);
     ticketRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -115,7 +115,19 @@ export default function MdScreen() {
 
   // clicking a position/live-card opens a symbol detail popup over the screen
   const [detail, setDetail] = useState(null);
-  function actOnPosition(p, kind) {
+  const [cancelling, setCancelling] = useState(() => new Set());
+  async function actOnPosition(p, kind) {
+    if (kind === "Cancel orders") {
+      setCancelling((s) => new Set(s).add(p.symbol));   // grey the row immediately
+      try {
+        await cancelPosition(p.symbol, p.clientId);
+        notify("warning", `Cancelled · ${p.symbol}`);
+      } catch {
+        setCancelling((s) => { const n = new Set(s); n.delete(p.symbol); return n; });
+        notify("error", `Cancel failed · ${p.symbol}`);
+      }
+      return;
+    }
     notify(kind === "Modify stop" ? "info" : "warning", `${kind} · ${p.symbol}`);
   }
 
@@ -199,13 +211,20 @@ export default function MdScreen() {
       .slice(0, 16),
     [positions],
   );
+  // Real resting orders from the engine's pending_stop — the actual protective
+  // SELL/cover order, which auto-updates as the engine modifies it after a fill.
   const working = useMemo(
-    () => positions.map((p) => {
-      const long = p.strategy === "LONG";
-      if (p.qty) return { symbol: p.symbol, asset: p.asset, side: long ? "SELL" : "BUY", type: "STP", note: "protective", qty: p.qty, price: p.stop, status: "Working" };
-      if (p.state === "WAITING_REENTRY") return { symbol: p.symbol, asset: p.asset, side: long ? "BUY" : "SELL", type: "LMT", note: "re-entry", qty: 100, price: p.entry, status: "Working" };
-      return { symbol: p.symbol, asset: p.asset, side: long ? "BUY" : "SELL", type: "STP LMT", note: "entry", qty: 100, price: p.trigger || p.last, status: "PreSubmitted" };
-    }),
+    () => positions
+      .filter((p) => p.protective && p.protective.stop_price)
+      .map((p) => {
+        const pr = p.protective;
+        return {
+          symbol: p.symbol, asset: p.asset, side: pr.side,
+          type: pr.order_type || "STP", note: "protective",
+          qty: pr.qty, price: pr.limit_price || pr.stop_price,
+          status: "Working", orderId: pr.order_id,
+        };
+      }),
     [positions],
   );
 
@@ -225,14 +244,14 @@ export default function MdScreen() {
         selected={detail?.symbol}
         onPick={setDetail}
         onNew={() => ticketRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })}
-        onRegen={() => setData(generateMdData())}
+        onRegen={undefined}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
         <TopBar />
         <main className="w-full flex-1 space-y-5 px-8 py-6">
           {/* KPI ROW */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
+          <div id="sec-home" className="scroll-mt-24 grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-6">
             {kpis.map((k) => (
               <div key={k.label} className="rounded-xl border border-zinc-200 bg-white px-4 py-3 shadow-sm transition-colors hover:border-zinc-300">
                 <div className="flex items-center justify-between">
@@ -250,7 +269,9 @@ export default function MdScreen() {
           {/* MAIN GRID: curve + positions (left) · order ticket + alerts (right) */}
           <div className="grid grid-cols-1 gap-5 xl:[grid-template-columns:minmax(0,1fr)_360px]">
             <div className="min-w-0 space-y-5">
-              <Positions rows={shown} asset={assetFilter} setAsset={setAssetFilter} onPick={setDetail} selected={detail?.symbol} onAction={actOnPosition} />
+              <div id="sec-positions" className="scroll-mt-24">
+                <Positions rows={shown} asset={assetFilter} setAsset={setAssetFilter} onPick={setDetail} selected={detail?.symbol} onAction={actOnPosition} cancelling={cancelling} />
+              </div>
 
               <Card
                 title="Cumulative P&L — Today"
@@ -282,16 +303,20 @@ export default function MdScreen() {
                 onPlaced={handlePlaced}
                 approval
               />
-              <Alerts alerts={alerts} />
+              <div id="sec-activity" className="scroll-mt-24"><Alerts alerts={alerts} /></div>
             </div>
           </div>
 
-          <SystemLogs />
+          <div id="sec-logs" className="scroll-mt-24"><SystemLogs /></div>
         </main>
       </div>
 
       {detail && (
-        <PositionDetail p={detail} onClose={() => setDetail(null)} onOrder={(pp) => { pickPosition(pp); setDetail(null); }} />
+        <PositionDetail
+          p={positions.find((x) => x.symbol === detail.symbol) || detail}
+          onClose={() => setDetail(null)}
+          onOrder={(pp) => { pickPosition(pp); setDetail(null); }}
+        />
       )}
       <Toaster position="top-center" theme="light" />
     </div>
@@ -319,16 +344,24 @@ function ChartTip({ active, payload, label }) {
     </div>
   );
 }
-function SymbolChart({ p }) {
+function SymbolChart({ p, series }) {
+  const pts = series && series.length ? series : (p.series || []);
   const data = useMemo(() => {
-    const rows = p.series.map((s) => ({ ...s, buy: null, sell: null }));
-    for (const f of p.fills) {
+    const rows = pts.map((s) => ({ ...s, buy: null, sell: null }));
+    for (const f of (p.fills || [])) {
+      if (f.x == null) continue;
       const r = rows[Math.min(rows.length - 1, f.x)];
-      if (f.side === "BUY") r.buy = f.price; else r.sell = f.price;
+      if (r) { if (f.side === "BUY") r.buy = f.price; else r.sell = f.price; }
     }
     return rows;
-  }, [p]);
+  }, [pts, p.fills]);
+  const entryN = Number(p.entry) || 0;
+  const stopN = Number(p.stop) || 0;
+  const trigN = Number(p.trigger) || 0;
   const axis = { tick: { fontSize: 10, fill: "#a1a1aa", fontFamily: "JetBrains Mono" }, tickLine: false };
+  if (!data.length) {
+    return <div className="grid h-[300px] place-items-center font-mono text-[11px] text-zinc-400">No ticks in the last 30 min.</div>;
+  }
   return (
     <div className="h-[300px] w-full">
       <ResponsiveContainer>
@@ -339,11 +372,12 @@ function SymbolChart({ p }) {
               <stop offset="100%" stopColor="#71717a" stopOpacity="0" />
             </linearGradient>
           </defs>
-          <XAxis dataKey="t" {...axis} axisLine={{ stroke: "#e4e4e7" }} />
+          <XAxis dataKey="t" {...axis} axisLine={{ stroke: "#e4e4e7" }} minTickGap={40} />
           <YAxis domain={["auto", "auto"]} orientation="right" width={56} {...axis} axisLine={false} />
           <Tooltip content={<ChartTip />} />
-          <ReferenceLine y={p.entry} stroke="#a1a1aa" strokeDasharray="4 3" strokeWidth={1} />
-          <ReferenceLine y={p.stop} stroke="#ef4444" strokeDasharray="4 3" strokeWidth={1} />
+          {trigN > 0 && <ReferenceLine y={trigN} stroke="#7c3aed" strokeDasharray="5 3" strokeWidth={1} />}
+          {entryN > 0 && <ReferenceLine y={entryN} stroke="#a1a1aa" strokeDasharray="4 3" strokeWidth={1} />}
+          {stopN > 0 && <ReferenceLine y={stopN} stroke="#ef4444" strokeDasharray="4 3" strokeWidth={1} />}
           <Area type="monotone" dataKey="price" stroke="#3f3f46" strokeWidth={1.4} fill="url(#pxf)" isAnimationActive={false} />
           <Scatter dataKey="buy" fill="#2563eb" isAnimationActive={false} />
           <Scatter dataKey="sell" fill="#f59e0b" isAnimationActive={false} />
@@ -359,7 +393,28 @@ function PositionDetail({ p, onClose, onOrder }) {
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, [onClose]);
-  const chg = ((p.last - p.entry) / p.entry) * 100;
+  // Trades Sheet: fetch the real execution history lazily on open (order.csv
+  // via /api/fills). Falls back to whatever's on the row for demo mode.
+  const [liveFills, setLiveFills] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => fetchFills(p.symbol).then((fs) => { if (alive && Array.isArray(fs)) setLiveFills(fs); });
+    load();
+    const iv = setInterval(load, 5000);   // keep fills current while open
+    return () => { alive = false; clearInterval(iv); };
+  }, [p.symbol]);
+  const fills = (liveFills && liveFills.length ? liveFills : p.fills) || [];
+  // Price chart: fetch the last 30 min from the feed audit on open.
+  const [hist, setHist] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => fetchHistory(p.symbol).then((h) => { if (alive && Array.isArray(h)) setHist(h); });
+    load();
+    const iv = setInterval(load, 4000);   // keep the price plot updating in real time
+    return () => { alive = false; clearInterval(iv); };
+  }, [p.symbol]);
+  // Guard entry=0 (monitoring/flat) so % isn't Infinity.
+  const chg = p.entry > 0 ? ((p.last - p.entry) / p.entry) * 100 : null;
   const value = p.qty ? p.last * p.qty : 0;
   const buy = Math.max(0, Math.min(100, p.buyPct));
   const pill = "rounded-full border border-zinc-200 bg-white px-2.5 py-1 font-mono text-[11px] tabular-nums";
@@ -380,7 +435,9 @@ function PositionDetail({ p, onClose, onOrder }) {
               </div>
               <div className="mt-1 flex items-baseline gap-2">
                 <span className="font-mono text-2xl font-medium tabular-nums text-zinc-900">{p.last}</span>
-                <span className={`font-mono text-[12px] tabular-nums ${chg >= 0 ? "text-emerald-600" : "text-red-600"}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(2)}%</span>
+                {chg == null
+                  ? <span className="font-mono text-[12px] tabular-nums text-zinc-400">flat</span>
+                  : <span className={`font-mono text-[12px] tabular-nums ${chg >= 0 ? "text-emerald-600" : "text-red-600"}`}>{chg >= 0 ? "+" : ""}{chg.toFixed(2)}%</span>}
               </div>
             </div>
             {/* live bid/ask/spread */}
@@ -411,7 +468,7 @@ function PositionDetail({ p, onClose, onOrder }) {
                     <span className="flex items-center gap-1"><span className="h-px w-3 bg-red-400" />Stop</span>
                   </div>
                 </div>
-                <div className="px-2 py-2"><SymbolChart p={p} /></div>
+                <div className="px-2 py-2"><SymbolChart p={p} series={hist} /></div>
               </div>
             </div>
             {/* right stats */}
@@ -442,6 +499,7 @@ function PositionDetail({ p, onClose, onOrder }) {
             <Label>Position</Label>
             <div className="mt-2 grid grid-cols-2 gap-2.5 sm:grid-cols-4 lg:grid-cols-8">
               <DCell label="Qty">{p.qty ? p.qty.toLocaleString() : "flat"}</DCell>
+              <DCell label="Trigger">{p.trigger}</DCell>
               <DCell label="Entry">{p.entry}</DCell>
               <DCell label="Stop" tone="neg">{p.stop}</DCell>
               <DCell label="Offset">{p.offset}</DCell>
@@ -468,7 +526,7 @@ function PositionDetail({ p, onClose, onOrder }) {
           <div>
             <div className="flex items-center justify-between">
               <Label>Trades Sheet</Label>
-              <span className="font-mono text-[10px] tabular-nums text-zinc-400">{p.fills.length} fills · avg comm ${p.avgCommission} · times in Dubai (GST)</span>
+              <span className="font-mono text-[10px] tabular-nums text-zinc-400">{fills.length} fills · times in Dubai (GST)</span>
             </div>
             <div className="mt-2 overflow-hidden rounded-xl border border-zinc-200">
               <div className={`${tc} border-b border-zinc-100 bg-zinc-50 py-2.5 text-[9px] font-mono uppercase tracking-[0.16em] text-zinc-400`}>
@@ -485,7 +543,7 @@ function PositionDetail({ p, onClose, onOrder }) {
                 <span className="text-right">P&L</span>
               </div>
               <div className="divide-y divide-zinc-100">
-                {p.fills.map((f, i) => (
+                {fills.map((f, i) => (
                   <div key={i} className={`${tc} py-2.5 font-mono text-[12px] tabular-nums transition-colors hover:bg-zinc-50`}>
                     <span className="text-zinc-500">{fmtDubai(f.ts)}</span>
                     <span className={f.side === "BUY" ? "font-medium text-emerald-600" : "font-medium text-red-600"}>{f.side}</span>
@@ -517,8 +575,13 @@ function PositionDetail({ p, onClose, onOrder }) {
 }
 
 // ── sidebar ────────────────────────────────────────────────────────────────
-function Sidebar({ onNew, onRegen, live = [], onPick, selected }) {
-  const nav = ["Overview", "Positions", "Activity", "Statements"];
+function Sidebar({ onNew, live = [], onPick, selected }) {
+  const [active, setActive] = useState("home");
+  const navTo = (id) => {
+    const el = document.getElementById(`sec-${id}`);
+    if (el) { setActive(id); el.scrollIntoView({ behavior: "smooth", block: "start" }); }
+    else { const item = MENU_ITEMS.find((m) => m[0] === id); notify("info", `${item ? item[1] : "View"} — coming soon`); }
+  };
   return (
     <aside className="sticky top-0 flex h-screen w-[300px] shrink-0 flex-col border-r border-zinc-200 bg-white px-5 py-5">
       <div className="flex items-center gap-2.5 px-1">
@@ -551,11 +614,18 @@ function Sidebar({ onNew, onRegen, live = [], onPick, selected }) {
 
       <div className="mt-6 px-1"><Label>Views</Label></div>
       <nav className="mt-2 space-y-0.5">
-        {nav.map((n, i) => (
-          <button key={n} className={`flex w-full items-center rounded-lg px-3 py-2 text-[12px] font-medium transition-colors ${i === 0 ? "bg-zinc-900 text-white" : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"}`}>
-            {n}
-          </button>
-        ))}
+        {MENU_ITEMS.map(([id, label, desc]) => {
+          const on = active === id;
+          return (
+            <button key={id} onClick={() => navTo(id)} className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors ${on ? "bg-zinc-900" : "hover:bg-zinc-100"}`}>
+              <svg viewBox="0 0 16 16" className={`h-4 w-4 shrink-0 ${on ? "text-white" : "text-zinc-400"}`} fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">{MENU_ICONS[id]}</svg>
+              <div className="min-w-0 flex-1">
+                <div className={`text-[12px] font-medium ${on ? "text-white" : "text-zinc-800"}`}>{label}</div>
+                <div className={`truncate text-[9px] ${on ? "text-white/45" : "text-zinc-400"}`}>{desc}</div>
+              </div>
+            </button>
+          );
+        })}
       </nav>
 
       {/* live positions — minimal stacked cards (ticker · side · qty · LTP) */}
@@ -590,12 +660,9 @@ function Sidebar({ onNew, onRegen, live = [], onPick, selected }) {
       </div>
 
       <div className="mt-4 shrink-0 space-y-2">
-        <button onClick={onRegen} className="w-full rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-500 transition-colors hover:border-zinc-400 hover:text-zinc-900">
-          Regenerate demo
-        </button>
         <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-3 py-2 font-mono text-[10px] text-zinc-500">
           <div className="flex items-center justify-between"><span>TWS 127.0.0.1:7497</span><span className="h-2 w-2 rounded-full bg-emerald-500" /></div>
-          <div className="mt-1 text-zinc-400">paper · demo data · v0.1</div>
+          <div className="mt-1 text-zinc-400">paper · live · v0.1</div>
         </div>
       </div>
     </aside>
@@ -637,8 +704,12 @@ function RowAct({ tone, children, onClick }) {
   return <button onClick={onClick} className={`rounded-full border px-2 py-1 text-[9px] font-bold uppercase tracking-[0.1em] transition-colors ${map[tone]}`}>{children}</button>;
 }
 
-function Positions({ rows, asset, setAsset, onPick, selected, onAction }) {
-  const cols = "grid grid-cols-[1.3fr_0.95fr_0.6fr_0.85fr_0.85fr_0.7fr_0.55fr_1fr_0.85fr] items-center gap-x-3";
+function Positions({ rows, asset, setAsset, onPick, selected, onAction, cancelling = new Set() }) {
+  // Click the Offset / SL headers to flip that column between value and %.
+  const [offMode, setOffMode] = useState("VAL");  // VAL (entry-limit price) | PCT
+  const [slMode, setSlMode] = useState("PCT");     // PCT | VAL (stop price)
+  // Symbol · State · Qty · Entry · Last · Trigger · Offset · SL% · Value · P&L
+  const cols = "grid grid-cols-[1.35fr_0.95fr_0.55fr_0.82fr_0.82fr_0.9fr_0.82fr_0.5fr_0.95fr_0.8fr] items-center gap-x-3.5";
   return (
     <Card
       title="Positions & Strategies"
@@ -651,7 +722,7 @@ function Positions({ rows, asset, setAsset, onPick, selected, onAction }) {
       }
     >
       <div className={`${cols} mb-2 border-b border-zinc-100 pb-2 text-[9px] font-mono uppercase tracking-[0.16em] text-zinc-400`}>
-        <span>Symbol</span><span>State</span><span className="text-right">Qty</span><span className="text-right">Entry</span><span className="text-right">Last</span><span className="text-right">Offset</span><span className="text-right">SL %</span><span className="text-right">Value</span><span className="text-right">P&L</span>
+        <span>Symbol</span><span>State</span><span className="text-right">Qty</span><span className="text-right">Entry</span><span className="text-right">Last</span><span className="text-right text-zinc-500">Trigger</span><span onClick={() => setOffMode((m) => (m === "VAL" ? "PCT" : "VAL"))} title="Toggle value / %" className="cursor-pointer select-none text-right transition-colors hover:text-zinc-700">Offset{offMode === "PCT" ? " %" : ""} ⇅</span><span onClick={() => setSlMode((m) => (m === "PCT" ? "VAL" : "PCT"))} title="Toggle % / stop price" className="cursor-pointer select-none text-right transition-colors hover:text-zinc-700">SL{slMode === "PCT" ? " %" : ""} ⇅</span><span className="text-right">Value</span><span className="text-right">P&L</span>
       </div>
       <div className="space-y-px">
         {rows.map((p) => (
@@ -659,19 +730,20 @@ function Positions({ rows, asset, setAsset, onPick, selected, onAction }) {
             key={p.symbol}
             onClick={() => onPick?.(p)}
             title="View details"
-            className={`${cols} group relative cursor-pointer rounded-lg px-1 py-2 transition-colors ${selected === p.symbol ? "bg-zinc-50 ring-1 ring-inset ring-zinc-900/10" : "hover:bg-zinc-50"}`}
+            className={`${cols} group relative cursor-pointer rounded-lg px-1 py-2 transition-all ${cancelling.has(p.symbol) ? "pointer-events-none opacity-40 grayscale" : selected === p.symbol ? "bg-zinc-50 ring-1 ring-inset ring-zinc-900/10" : "hover:bg-zinc-50"}`}
           >
             <div className="flex items-center gap-2">
               <span className={`inline-block h-1.5 w-1.5 rounded-full ${p.strategy === "LONG" ? "bg-emerald-500" : "bg-red-500"}`} />
               <span className="text-[13px] font-medium text-zinc-900">{p.symbol}</span>
               <span className="font-mono text-[9px] uppercase tracking-wide text-zinc-400">{p.asset} · {p.strategy}</span>
             </div>
-            <div><span className={`rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.12em] ${STATE_TONE[p.state]}`}>{p.state.replace(/_/g, " ")}</span></div>
+            <div><span className={`inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-[0.1em] ${STATE_TONE[p.state]}`}>{p.state === "WAITING_REENTRY" ? "RE-ENTRY" : p.state.replace(/_/g, " ")}</span></div>
             <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.qty ? p.qty.toLocaleString() : <span className="text-zinc-300">flat</span>}</div>
             <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.entry}</div>
             <div className="text-right font-mono text-[12px] tabular-nums text-zinc-800">{p.last}</div>
-            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.offset}</div>
-            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{p.slPct}%</div>
+            <div className="text-right font-mono text-[12px] font-medium tabular-nums text-zinc-900">{p.trigger}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{offMode === "PCT" ? p.offsetPct : p.offset}</div>
+            <div className="text-right font-mono text-[12px] tabular-nums text-zinc-500">{slMode === "PCT" ? `${p.slPct}%` : p.stop}</div>
             <div className="text-right font-mono text-[12px] tabular-nums text-zinc-800">{p.qty ? fmtUsd(p.last * p.qty) : <span className="text-zinc-300">—</span>}</div>
             <div className="text-right font-mono text-[12px] tabular-nums">{p.pnl ? <Money value={p.pnl} /> : <span className="text-zinc-300">—</span>}</div>
 
@@ -1285,7 +1357,7 @@ export function MdMobile() {
       <StartEngineBar onStart={() => setSheet(true)} />
       {sheet && <OrderSheet order={order} setOrder={setOrder} onClose={() => setSheet(false)} onPlaced={handlePlaced} approval />}
       {detail && (
-        <PositionDetail p={detail} onClose={() => setDetail(null)} onOrder={(pp) => { setOrder((o) => toStrat(pp, o)); setDetail(null); setSheet(true); }} />
+        <PositionDetail p={positions.find((x) => x.symbol === detail.symbol) || detail} onClose={() => setDetail(null)} onOrder={(pp) => { setOrder((o) => toStrat(pp, o)); setDetail(null); setSheet(true); }} />
       )}
       {/* island owns the top; Sileo toasts pop from the bottom so they don't fight */}
       <Toaster position="bottom-center" theme="light" />
@@ -1297,7 +1369,7 @@ export function MdMobile() {
 const ORDER0 = {
   mode: "STRATEGY", strategyId: "long_breakout", asset: "EQUITY", symbol: "NVDA",
   qty: "100", value: "10000", sizeMode: "QTY", trigger: "0",
-  stop: "0.05", stopUnit: "PCT", offset: "0.05", offsetUnit: "ABS",
+  stop: "0.5", stopUnit: "PCT", offset: "0.5", offsetUnit: "PCT",
   orderType: "MKT", limitPrice: "0", stopPrice: "0", tif: "DAY",
 };
 function OrderSheet({ order, setOrder, onClose, onPlaced, approval }) {
@@ -1317,7 +1389,7 @@ function toStrat(p, o) {
 
 // ── mobile ② — FOCUS DECK: hero P&L + swipeable position cards ───────────────
 export function MdMobileFocus() {
-  const [data] = useState(() => generateMdData());
+  const data = useMdData(); // live backend when up, demo otherwise
   const { account, pnl_series, positions } = data;
   const [detail, setDetail] = useState(null);
   const [sheet, setSheet] = useState(false);
@@ -1370,7 +1442,7 @@ export function MdMobileFocus() {
 
       <button onClick={() => setSheet(true)} className="fixed bottom-5 left-1/2 z-20 -translate-x-1/2 rounded-full bg-zinc-900 px-6 py-3.5 text-xs font-bold uppercase tracking-widest text-white shadow-xl shadow-zinc-300">+ New Order</button>
       {sheet && <OrderSheet order={order} setOrder={setOrder} onClose={() => setSheet(false)} />}
-      {detail && <PositionDetail p={detail} onClose={() => setDetail(null)} onOrder={(pp) => { setOrder((o) => toStrat(pp, o)); setDetail(null); setSheet(true); }} />}
+      {detail && <PositionDetail p={positions.find((x) => x.symbol === detail.symbol) || detail} onClose={() => setDetail(null)} onOrder={(pp) => { setOrder((o) => toStrat(pp, o)); setDetail(null); setSheet(true); }} />}
       <Toaster position="top-center" theme="light" />
     </div>
   );
@@ -1378,7 +1450,7 @@ export function MdMobileFocus() {
 
 // ── mobile ③ — COMMAND: order ticket is the hero, positions below ────────────
 export function MdMobileCommand() {
-  const [data] = useState(() => generateMdData());
+  const data = useMdData(); // live backend when up, demo otherwise
   const { account, positions } = data;
   const [detail, setDetail] = useState(null);
   const [order, setOrder] = useState(ORDER0);
@@ -1404,7 +1476,7 @@ export function MdMobileCommand() {
           </div>
         </div>
       </main>
-      {detail && <PositionDetail p={detail} onClose={() => setDetail(null)} onOrder={(pp) => { setOrder((o) => toStrat(pp, o)); setDetail(null); }} />}
+      {detail && <PositionDetail p={positions.find((x) => x.symbol === detail.symbol) || detail} onClose={() => setDetail(null)} onOrder={(pp) => { setOrder((o) => toStrat(pp, o)); setDetail(null); }} />}
       <Toaster position="top-center" theme="light" />
     </div>
   );
